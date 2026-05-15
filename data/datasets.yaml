@@ -1,0 +1,38 @@
+version: "1.0"
+
+datasets:
+  burmese_asr:
+    name: "Burmese ASR SLR80 Dataset"
+    language: "my"
+    type: "single_speaker"
+    raw_dir: "data/raw/burmese_asr"
+    processed_dir: "data/processed/burmese_asr"
+    splits:
+      train:
+        metadata: "speech_asr_slr80_my_trainsets.csv"
+        audio_column: "Audio:FILE"
+        text_column: "Text:LABEL"
+        audio_subdir: "train"
+      dev:
+        metadata: "speech_asr_slr80_my_devsets.csv"
+        audio_column: "Audio:FILE"
+        text_column: "Text:LABEL"
+        audio_subdir: "dev"
+      test:
+        metadata: "speech_asr_slr80_my_testsets.csv"
+        audio_column: "Audio:FILE"
+        text_column: "Text:LABEL"
+        audio_subdir: "test"
+    ground_truth_format: "csv"
+    description: "缅甸语朗读数据，用于验证ASR准确率。单说话人，不适合测试diarization和声纹识别。"
+
+  # 示例：后续添加多说话人数据集
+  # chinese_meeting:
+  #   name: "Chinese Meeting Recordings"
+  #   language: "zh"
+  #   type: "multi_speaker"
+  #   raw_dir: "data/raw/chinese_meeting"
+  #   processed_dir: "data/processed/chinese_meeting"
+  #   metadata_file: "metadata.json"
+  #   speaker_info: "speakers.json"
+  #   description: "中文会议录音，用于测试说话人分段和声纹识别"
