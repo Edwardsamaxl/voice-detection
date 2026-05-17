@@ -25,6 +25,13 @@ class FaissVectorIndex:
         if vectors.shape[0] != len(spk_ids):
             raise ValueError("vectors and spk_ids must have the same length")
 
+        if vectors.shape[0] == 0:
+            self.dim = int(vectors.shape[1])
+            self.index = None
+            self.vectors = vectors.astype(np.float32)
+            self.labels = []
+            return
+
         import faiss
 
         self.dim = int(vectors.shape[1])

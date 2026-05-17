@@ -12,14 +12,16 @@ from src.core.storage import JsonStorage, NpzStorage
 from src.core.types import SpeakerSegment
 
 
-def segment_from_record(record: dict) -> SpeakerSegment:
+def segment_from_record(record: dict, fallback_file: str = "", fallback_index: int = 0) -> SpeakerSegment:
     """Convert a cached segment record into a V2 SpeakerSegment."""
     embedding = record.get("embedding")
     if isinstance(embedding, list):
         embedding = np.asarray(embedding, dtype=np.float32)
+    file_key = str(record.get("file") or fallback_file)
+    segment_id = str(record.get("segment_id") or f"{file_key}_{fallback_index:04d}")
     return SpeakerSegment(
-        segment_id=str(record["segment_id"]),
-        file=str(record["file"]),
+        segment_id=segment_id,
+        file=file_key,
         start=float(record["start"]),
         end=float(record["end"]),
         local_speaker=str(record.get("local_speaker") or "UNKNOWN"),
@@ -46,13 +48,15 @@ def build_embedding_pool(npz_dir: str, segment_dir: str | None = None) -> Embedd
         embs = data.get("embeddings", np.array([]))
         meta_list = json_storage.load(basename)
         emb_idx = 0
-        for meta in meta_list:
-            has_emb = meta.get("has_embedding", False)
+        for meta_idx, meta in enumerate(meta_list):
+            has_emb = meta.get("has_embedding")
+            if has_emb is None:
+                has_emb = emb_idx < len(embs)
             if has_emb and embs.size > 0 and emb_idx < len(embs):
                 meta = dict(meta)
                 meta["embedding"] = np.asarray(embs[emb_idx], dtype=np.float32)
                 emb_idx += 1
-            seg = segment_from_record(meta)
+            seg = segment_from_record(meta, fallback_file=basename, fallback_index=meta_idx)
             if seg.embedding is not None:
                 pool.add(seg)
     return pool

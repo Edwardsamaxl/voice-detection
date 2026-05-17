@@ -141,6 +141,33 @@ def setup_whisper(model_dir: Path) -> None:
             time.sleep(DELAY_SECONDS)
 
 
+def setup_uniasr(target_dir: Path) -> None:
+    """Download UniASR model from ModelScope."""
+    from config import UNIASR_MODEL_ID  # noqa: E402
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if _already_present(target_dir, min_files=3):
+        print(f"[uniasr] already cached at {target_dir}")
+        return
+
+    print(f"[uniasr] Downloading {UNIASR_MODEL_ID} ...")
+    for attempt in range(1, RETRIES + 1):
+        try:
+            from modelscope.hub.snapshot_download import snapshot_download
+
+            snapshot_download(UNIASR_MODEL_ID, local_dir=str(target_dir))
+            print("[uniasr] done")
+            break
+        except Exception as exc:  # noqa: BLE001
+            print(f"[uniasr] attempt {attempt}/{RETRIES} failed: {exc}")
+            if attempt == RETRIES:
+                raise RuntimeError(
+                    f"Failed to download {UNIASR_MODEL_ID} after {RETRIES} attempts"
+                ) from exc
+            time.sleep(DELAY_SECONDS)
+
+
 def main() -> int:
     """Entry point."""
     _banner("Voice-Detection Model Setup")
@@ -172,6 +199,12 @@ def main() -> int:
         setup_whisper(models_dir / "whisper")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"whisper: {exc}")
+
+    # 4. uniasr
+    try:
+        setup_uniasr(models_dir / "uni_asr")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"uniasr: {exc}")
 
     _banner("Summary")
     if errors:

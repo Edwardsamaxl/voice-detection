@@ -89,14 +89,22 @@ class Translator:
                 "Install it: pip install transformers sentencepiece sacremoses"
             ) from exc
 
-        logger.info("Loading translation model %s ...", self.model_name)
+        model_name = self.model_name
+        local_fixed = os.path.join(MODELS_DIR, "translation", "nllb-fixed")
+        if os.path.isdir(local_fixed) and os.path.exists(os.path.join(local_fixed, "config.json")):
+            model_name = local_fixed
+
+        logger.info("Loading translation model %s ...", model_name)
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
+            model_name,
             cache_dir=self.cache_dir,
+            local_files_only=(model_name == local_fixed),
         )
         self._model = AutoModelForSeq2SeqLM.from_pretrained(
-            self.model_name,
+            model_name,
             cache_dir=self.cache_dir,
+            use_safetensors=True,
+            local_files_only=(model_name == local_fixed),
         ).to(self.device)
         self._model.eval()
 

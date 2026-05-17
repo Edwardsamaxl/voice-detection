@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 
+from config import CENTROID_THRESHOLD, MIN_CLUSTER_SIZE, UPDATE_MIN_DURATION
 from src.clustering.cluster import (
     assign_global_speakers,
     assign_global_speakers_from_slr80_filename,
@@ -23,6 +24,7 @@ from src.speaker_db.vector_index import FaissVectorIndex
 def build_pipeline(
     embedding_dir: str,
     label_strategy: str = "cluster",
+    repo: SpeakerRepository | None = None,
 ) -> SpeakerRepository:
     """Build a speaker repository from cached embeddings."""
     pool = build_embedding_pool(embedding_dir)
@@ -34,9 +36,9 @@ def build_pipeline(
         clustered_pool = assign_global_speakers_from_slr80_filename(pool)
     else:
         raise ValueError(f"Unknown label_strategy: {label_strategy}")
-    repo = SpeakerRepository(vector_index=FaissVectorIndex())
-    repo.build_from_pool(clustered_pool)
-    return repo
+    target_repo = repo or SpeakerRepository(vector_index=FaissVectorIndex())
+    target_repo.build_from_pool(clustered_pool)
+    return target_repo
 
 
 def recognize_pipeline(
@@ -47,29 +49,25 @@ def recognize_pipeline(
     asr_model: str = "base",
     hf_token: str | None = None,
     device: str | None = None,
+    asr_backend: str = "uniasr",
 ) -> list[SpeakerSegment]:
     """Run full recognition pipeline on a new audio file.
 
     Stages:
       1. Diarization → speaker time segments
       2. Embedding extraction + speaker identification
-      3. Whisper ASR → transcribed segments
+      3. ASR (Whisper or UniASR) → transcribed segments
       4. Align ASR segments to diarization speakers
       5. Map text into diarization segments and translate
+
+    Args:
+        asr_backend: ``"whisper"`` or ``"uniasr"``.
 
     Returns:
         List of SpeakerSegment with global_speaker, text, and translation.
     """
-    from config import (
-        CENTROID_THRESHOLD,
-        MIN_CLUSTER_SIZE,
-        MIN_DURATION,
-        MIN_DURATION_OFF,
-        MIN_DURATION_ON,
-        UPDATE_MIN_DURATION,
-    )
+    from config import MIN_DURATION, MIN_DURATION_OFF, MIN_DURATION_ON
     from src.asr.align import align_segments
-    from src.asr.whisper_asr import transcribe
     from src.diarization.postprocess import annotation_to_segments, merge_short_segments
     from src.diarization.segment import run_diarization
 
@@ -99,6 +97,8 @@ def recognize_pipeline(
             result = repo.identify(seg.embedding)
             if result.speaker:
                 seg = seg.with_global_speaker(result.speaker)
+                if result.confidence == "high":
+                    repo.update_speaker(result.speaker, seg.embedding, seg.duration)
             elif result.confidence != "high":
                 if seg.duration < UPDATE_MIN_DURATION:
                     seg = seg.with_global_speaker("UNKNOWN")
@@ -112,15 +112,25 @@ def recognize_pipeline(
                     seg = seg.with_global_speaker(new_spk_id)
         identified_segments.append(seg)
 
-    whisper_segments = transcribe(wav_path, language="my", model_name=asr_model)
-    aligned_whisper = align_segments(whisper_segments, merged)
+    if asr_backend == "uniasr":
+        from src.asr.uniasr_asr import transcribe_uniasr
+
+        asr_segments = transcribe_uniasr(wav_path)
+    else:
+        from src.asr.whisper_asr import transcribe
+
+        asr_segments = transcribe(wav_path, language="my", model_name=asr_model)
+    aligned_asr = align_segments(asr_segments, merged)
 
     result_segments: list[SpeakerSegment] = []
     for diar_seg in identified_segments:
         texts = [
             ws.text.strip()
-            for ws in aligned_whisper
-            if ws.end > diar_seg.start and ws.start < diar_seg.end and ws.text
+            for ws in aligned_asr
+            if ws.end > diar_seg.start
+            and ws.start < diar_seg.end
+            and ws.local_speaker == diar_seg.local_speaker
+            and ws.text
         ]
         text = " ".join(texts).strip()
         translation = None

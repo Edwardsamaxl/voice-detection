@@ -94,6 +94,7 @@ def cmd_recognize(args: argparse.Namespace) -> None:
             asr_model=args.asr_model,
             hf_token=args.hf_token,
             device=args.device,
+            asr_backend=args.asr_backend,
         )
 
         result = [
@@ -138,7 +139,8 @@ def main() -> None:
     rec_parser.add_argument("--repo_dir", default=None, help="Speaker repository directory")
     rec_parser.add_argument("--output", "-o", default=None, help="Output JSON file path")
     rec_parser.add_argument("--device", default=None, help="Device for models (cpu/cuda)")
-    rec_parser.add_argument("--asr_model", default="base", help="Whisper model name")
+    rec_parser.add_argument("--asr_backend", default="uniasr", choices=["uniasr", "whisper"], help="ASR backend")
+    rec_parser.add_argument("--asr_model", default="base", help="Whisper model name (only used when asr_backend=whisper)")
     rec_parser.add_argument("--hf_token", default=None, help="HuggingFace token for gated models")
     rec_parser.add_argument("--no_translate", action="store_true", help="Skip translation")
 

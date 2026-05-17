@@ -166,3 +166,7 @@ Thumbs.db
 ._____temp/
 check.md
 *.docx
+
+# Local log files
+*.log
+

@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from config import DISTANCE_THRESHOLD
+from config import CENTROID_THRESHOLD, DISTANCE_THRESHOLD, MIN_CLUSTER_SIZE
 from src.clustering.cluster import (
     assign_global_speakers,
     assign_global_speakers_from_slr80_filename,
@@ -50,6 +50,18 @@ def main():
         help="Clustering distance threshold.",
     )
     parser.add_argument(
+        "--centroid_threshold",
+        type=float,
+        default=CENTROID_THRESHOLD,
+        help="Second-stage centroid merge threshold.",
+    )
+    parser.add_argument(
+        "--min_cluster_size",
+        type=int,
+        default=MIN_CLUSTER_SIZE,
+        help="Minimum cluster size for second-stage merging.",
+    )
+    parser.add_argument(
         "--label_strategy",
         default="cluster",
         choices=["cluster", "slr80_filename"],
@@ -72,6 +84,8 @@ def main():
         clustered_pool = assign_global_speakers(
             pool,
             distance_threshold=args.distance_threshold,
+            centroid_threshold=args.centroid_threshold,
+            min_cluster_size=args.min_cluster_size,
         )
     else:
         logger.info("Assigning SLR80 speaker ids from filenames...")

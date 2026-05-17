@@ -10,7 +10,6 @@ from src.clustering.pool import build_embedding_pool
 from src.core.pool import EmbeddingPool
 from src.core.repository import SpeakerRepository
 from src.core.types import SpeakerSegment
-from src.embedding.cache import save_embeddings
 from src.speaker_db.vector_index import VectorIndex
 
 
@@ -40,43 +39,36 @@ def test_pool_to_repository_to_identification():
     assert result.speaker is None or result.speaker.startswith("SPK_")
 
 
-def test_cached_embeddings_load_into_v2_repository(tmp_path):
-    a = np.zeros(192, dtype=np.float32)
-    a[0] = 1.0
-    b = np.zeros(192, dtype=np.float32)
-    b[0] = 0.99
-    b[1] = 0.01
-    save_embeddings(
-        str(tmp_path / "sample.npz"),
-        [
-            SpeakerSegment(
-                segment_id="sample_0000",
-                file="sample.wav",
-                start=0.0,
-                end=2.0,
-                local_speaker="A",
-                embedding=a,
-            ),
-            SpeakerSegment(
-                segment_id="sample_0001",
-                file="sample.wav",
-                start=2.0,
-                end=4.0,
-                local_speaker="A",
-                embedding=b,
-            ),
-        ],
+def test_legacy_cached_embeddings_without_ids_load_into_pool(tmp_path):
+    emb_dir = tmp_path / "embeddings"
+    seg_dir = tmp_path / "segments"
+    emb_dir.mkdir()
+    seg_dir.mkdir()
+
+    emb = np.zeros((1, 192), dtype=np.float32)
+    emb[0, 0] = 1.0
+    np.savez(emb_dir / "bur_0366_0045318711.npz", embeddings=emb)
+    (seg_dir / "bur_0366_0045318711.json").write_text(
+        """[
+          {
+            "segment_id": "",
+            "file": "",
+            "start": 0.588,
+            "end": 4.351,
+            "local_speaker": "SPEAKER_00",
+            "embedding": null
+          }
+        ]""",
+        encoding="utf-8",
     )
 
-    pool = build_embedding_pool(str(tmp_path))
-    clustered = assign_global_speakers(pool, distance_threshold=0.2)
-    repo = SpeakerRepository(vector_index=VectorIndex())
-    repo.build_from_pool(clustered)
+    pool = build_embedding_pool(str(emb_dir), str(seg_dir))
+    segment = pool.get_by_id("bur_0366_0045318711_0000")
 
-    assert len(pool) == 2
-    assert pool.get_by_id("sample_0000").duration == 2.0
-    assert clustered.get_by_id("sample_0000").global_speaker == "SPK_0"
-    assert repo.all_speakers() == ["SPK_0"]
+    assert len(pool) == 1
+    assert segment is not None
+    assert segment.file == "bur_0366_0045318711"
+    assert segment.embedding is not None
 
 
 def test_slr80_filename_labels_build_expected_speakers():

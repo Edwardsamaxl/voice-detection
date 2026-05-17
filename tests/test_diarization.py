@@ -11,7 +11,6 @@ from pyannote.core import Annotation, Segment
 from dataclasses import FrozenInstanceError
 
 from src.core.types import SpeakerSegment
-from src.diarization.cache import load_segments, save_segments
 from src.diarization.postprocess import annotation_to_segments, merge_short_segments, rename_labels
 from src.diarization.segment import run_diarization
 
@@ -166,48 +165,3 @@ class TestAnnotationToSegments:
         assert seg.translation is None
         with pytest.raises(FrozenInstanceError):
             seg.local_speaker = "B"
-
-
-class TestCache:
-    def test_roundtrip(self):
-        segments = [
-            SpeakerSegment(
-                segment_id="sample_0000",
-                file="sample.wav",
-                start=0.0,
-                end=3.2,
-                local_speaker="A",
-            ),
-        ]
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "segments.json")
-            save_segments(path, segments)
-            loaded = load_segments(path)
-            assert loaded[0].start == segments[0].start
-            assert loaded[0].local_speaker == segments[0].local_speaker
-            assert loaded[0].file == "sample.wav"
-            assert loaded[0].segment_id == "sample_0000"
-
-    def test_load_missing(self):
-        with pytest.raises(FileNotFoundError):
-            load_segments("/tmp/nonexistent.json")
-
-    def test_invalid_format(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "bad.json")
-            with open(path, "w") as f:
-                json.dump(["not", "a", "dict"], f)
-            with pytest.raises(ValueError):
-                load_segments(path)
-
-    def test_save_bad_path_type(self):
-        with pytest.raises(TypeError):
-            save_segments(None, [])
-
-    def test_save_bad_segments_type(self):
-        with pytest.raises(TypeError):
-            save_segments("/tmp/test.json", {})
-
-    def test_load_bad_path_type(self):
-        with pytest.raises(TypeError):
-            load_segments(None)

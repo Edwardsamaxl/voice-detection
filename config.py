@@ -55,3 +55,5 @@ RAW_DIR = os.path.join(DATA_DIR, "raw")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 OUTPUT_DIR = os.path.join(DATA_DIR, "output")
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+UNIASR_MODEL_DIR = os.path.join(MODELS_DIR, "uni_asr")
+UNIASR_MODEL_ID = "iic/speech_UniASR_asr_2pass-my-16k-common-vocab696-pytorch"
