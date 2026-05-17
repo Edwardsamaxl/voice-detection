@@ -129,8 +129,15 @@ dmypy.json
 cython_debug/
 
 # Model weights (large files)
+*.pt
+*.pth
+*.ckpt
+*.bin
 models/*/
 !models/.gitkeep
+
+# Local test caches
+.codex_realtest/
 
 # Audio / datasets (large files)
 data/raw/
