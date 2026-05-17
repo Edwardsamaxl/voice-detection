@@ -47,7 +47,7 @@ def phase2_diarization(wav_path: str) -> list:
     segments = annotation_to_segments(merged, min_duration=1.0)
     print(f"Segments found: {len(segments)}")
     for seg in segments[:3]:
-        print(f"  {seg['start']:.2f}s - {seg['end']:.2f}s | speaker={seg['local_speaker']}")
+        print(f"  {seg.start:.2f}s - {seg.end:.2f}s | speaker={seg.local_speaker}")
     if len(segments) > 3:
         print(f"  ... and {len(segments) - 3} more")
     return segments
@@ -63,11 +63,11 @@ def phase3_embedding(wav_path: str, segments: list) -> list:
     enriched = extractor.extract_segments(wav_path, segments)
     elapsed = time.time() - start
 
-    valid = [s for s in enriched if s.get("embedding") is not None]
+    valid = [s for s in enriched if s.embedding is not None]
     print(f"Extracted: {len(valid)}/{len(enriched)} segments in {elapsed:.2f}s")
 
     if valid:
-        emb = valid[0]["embedding"]
+        emb = valid[0].embedding
         print(f"Embedding dim: {emb.shape}, dtype: {emb.dtype}")
         print(f"Embedding norm (L2): {float((emb ** 2).sum() ** 0.5):.6f}")
     return enriched

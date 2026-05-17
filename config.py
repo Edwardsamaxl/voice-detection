@@ -22,6 +22,8 @@ EMBEDDING_DIM = 192
 
 # Clustering
 DISTANCE_THRESHOLD = 0.3
+CENTROID_THRESHOLD = 0.35
+MIN_CLUSTER_SIZE = 3
 DEDUP_THRESHOLD = 0.95
 
 # Speaker DB
@@ -38,6 +40,13 @@ MIN_WHISPER_SEGMENT = 0.5
 # Dynamic update
 UPDATE_MIN_DURATION = 2.0
 UPDATE_DEDUP_THRESHOLD = 0.95
+
+# Translation
+TRANSLATION_MODEL = os.environ.get(
+    "TRANSLATION_MODEL", "facebook/nllb-200-distilled-600M"
+)
+TRANSLATION_SRC_LANG = "mya_Mymr"
+TRANSLATION_TGT_LANG = "zho_Hans"
 
 # Paths
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))

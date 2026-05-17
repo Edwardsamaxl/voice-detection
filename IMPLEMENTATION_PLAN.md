@@ -1,6 +1,7 @@
-# 语音处理与声纹识别系统 — 实现计划（Prompt 版）
+# 语音处理与声纹识别系统 — 实现计划（V2.1 封装版）
 
 > **目标读者**：实现 Agent。本文档基于与负责人的需求对齐结果编写，实现时请严格遵循本文档，如有歧义优先以本文档为准。
+> **版本**：V2.1（2026-05-16）— 将所有裸 dict 数据结构封装为不可变 dataclass 与类接口。
 
 ---
 
@@ -60,104 +61,140 @@
 
 ## 二、系统架构与数据流
 
-### 2.1 最优架构（三层）
+### 2.1 最优架构（三层 + Core）
 
 ```
-embedding_pool（全量原始数据）    → 原始数据，不进 FAISS
+src/core/
+  ├── types.py          → SpeakerSegment, SpeakerProfile, SpeakerData (不可变 dataclass)
+  ├── pool.py           → EmbeddingPool (封装 segments + matrix + meta_index)
+  ├── storage.py        → Storage Protocol + JsonStorage / NpzStorage / MemoryStorage
+  ├── repository.py     → SpeakerRepository (统一 seam: speaker_db + vector_db + profile)
+  └── pipeline.py       → 【已清理】原 Stage Protocol + Pipeline 死代码已删除
+
+数据流：
+
+EmbeddingPool（全量原始数据，封装后）
         ↓
-speaker_db（聚类后）             → 每人一个 weighted center
+SpeakerRepository.build_from_pool()
         ↓
-vector_db（FAISS）               → 每人多个精选 embedding（5~20 个）
-        ↓
-speaker_profile（人名表）         → 显示层（SPK_ID → 姓名）
-        ↓
-data_store（结果缓存）           → 业务数据（分段 + speaker + text + translation）
+  ├─→ speaker_db（聚类后）   → 每人一个 weighted center
+  ├─→ vector_db（FAISS）     → 每人多个精选 embedding（5~20 个）
+  ├─→ speaker_profile（人名表）→ 显示层（SPK_ID → 姓名）
+  └─→ data_store（结果缓存）  → 业务数据（分段 + speaker + text + translation）
 ```
 
-### 2.2 关键数据结构
+### 2.2 核心数据结构（封装版）
 
-**（1）embedding_pool（分层结构）**
+**（1）SpeakerSegment（最小不可变单元）**
 
 ```python
-embedding_pool = {
-    "segments": [
-        {
-            "embedding": np.array([...]),   # 192 维声纹向量
-            "file": "A.wav",
-            "segment_id": "A_0001",         # 唯一标识
-            "start": 0.0,
-            "end": 3.2,
-            "duration": 3.2,
-            "local_speaker": "speaker_0",   # pyannote 内部分段标签
-            "global_speaker": "SPK_0",      # 聚类后统一 ID
-            "quality": 0.92                 # 可选质量评分
-        }
-    ],
-    "matrix": np.ndarray,                   # (N, 192) 向量矩阵，用于向量化计算
-    "meta_index": {"A_0001": 0, ...}       # segment_id → index，快速定位
-}
+@dataclass(frozen=True, slots=True)
+class SpeakerSegment:
+    segment_id: str       # 唯一标识，如 "A_0001"
+    file: str             # 来源文件
+    start: float
+    end: float
+    local_speaker: str    # pyannote 内部分段标签
+    global_speaker: str | None = None   # 聚类后统一 ID
+    display_name: str | None = None
+    embedding: np.ndarray | None = None
+    text: str | None = None
+    translation: str | None = None
+
+    @property
+    def duration(self) -> float: ...
+    def with_embedding(self, emb) -> SpeakerSegment: ...
+    def with_global_speaker(self, spk_id) -> SpeakerSegment: ...
+    def with_text(self, text, translation=None) -> SpeakerSegment: ...
 ```
 
-**（2）speaker_db（聚类后中心向量）**
+> **设计原则**：`frozen=True` 保证不可变，下游模块通过 `with_*` 方法派生新版本，杜绝偷偷改字段。
+
+**（2）EmbeddingPool（替代裸 dict embedding_pool）**
 
 ```python
-speaker_db = {
-    "SPK_0": {
-        "center": np.array([...]),          # 加权平均 + L2 归一化后的中心向量
-        "count": 12,                        # 该 speaker 的 embedding 数量
-        "embeddings": [emb1, emb2, ...]     # 该 speaker 的全量原始 embeddings（用于动态更新时重新计算 center）
-    }
-}
+class EmbeddingPool:
+    """封装 segments 列表、meta_index 和 matrix 缓存。"""
+
+    def add(self, segment: SpeakerSegment) -> None: ...
+    def get_by_id(self, segment_id: str) -> SpeakerSegment | None: ...
+    def to_matrix(self) -> np.ndarray: ...          # 懒构建 + 缓存
+    def apply_labels(self, labels: list[int], prefix="SPK_") -> EmbeddingPool: ...
+    def filter_by_speaker(self, spk_id: str) -> list[SpeakerSegment]: ...
 ```
 
-**（3）speaker_profile（人名元数据表）**
+> **关键差异**：旧设计中 `embedding_pool` 是裸 dict，调用者需要手动维护 `matrix` 和 `meta_index` 的一致性。新设计中 `EmbeddingPool` 内部管理这些一致性，`to_matrix()` 只在 dirty 时重建。
+
+**（3）SpeakerData（聚类后中心向量）**
 
 ```python
-speaker_profile = {
-    "SPK_0": {
-        "name": "张三",
-        "alias": ["老张", "Zhang San"],
-        "gender": "male",
-        "notes": "客户经理",
-        "created_at": "2026-04-01"
-    },
-    "SPK_1": {
-        "name": "UNKNOWN",
-        "alias": []
-    }
-}
+@dataclass(frozen=True, slots=True)
+class SpeakerData:
+    spk_id: str
+    center: np.ndarray          # 加权平均 + L2 归一化后的中心向量
+    embeddings: list[np.ndarray] # 全量原始 embeddings（用于动态更新时重新计算 center）
+    durations: list[float] | None = None  # 各 embedding 对应的片段时长（用于加权 center）
+    profile: SpeakerProfile | None = None
 ```
 
-**（4）vector_db（FAISS 索引）**
+**（4）SpeakerProfile（人名元数据表）**
 
 ```python
-vector_db = {
-    "index": faiss.IndexFlatIP(dim),        # 内积索引（归一化后等价于 cosine）
-    "labels": ["SPK_0", "SPK_0", "SPK_1", ...]  # 每个向量对应的 speaker ID
-}
+@dataclass(frozen=True, slots=True)
+class SpeakerProfile:
+    name: str
+    alias: list[str] | None = None
+    gender: str | None = None
+    notes: str | None = None
+    created_at: str | None = None
 ```
 
-> **关键设计**：FAISS 中采用**多向量表示**，每个 speaker 保留最多 `MAX_EMB=20` 个精选 embedding，而不是只存 1 个 center。这是为了支撑 TopK 一致性判断。
-
-**（5）data_store（业务结果缓存）**
+**（5）SpeakerRepository（统一 seam）**
 
 ```python
-data_store = {
-    "file1.wav": [
-        {
-            "start": 0.0,
-            "end": 3.2,
-            "duration": 3.2,
-            "local_speaker": "A",
-            "global_speaker": "SPK_0",
-            "display_name": "张三",
-            "embedding": [...],
-            "text": "မင်္ဂလာပါ",
-            "translation": "你好"
-        }
-    ]
-}
+class SpeakerRepository:
+    def build_from_pool(self, pool: EmbeddingPool, max_emb: int = MAX_EMB) -> None: ...
+    def identify(self, query_emb: np.ndarray) -> IdentificationResult: ...
+    def add_speaker(self, spk_id: str, embeddings: list[np.ndarray], durations: list[float], profile: SpeakerProfile | None = None) -> None: ...
+    def update_speaker(self, spk_id: str, new_emb: np.ndarray, duration: float) -> bool: ...
+    def assign_name(self, spk_id: str, name: str) -> None: ...
+    def get_speaker(self, spk_id: str) -> SpeakerData | None: ...
+    def all_speakers(self) -> list[str]: ...
+    def rebuild(self) -> None: ...
+    def save(self, key: str = "speaker_db:main") -> None: ...
+    def load(self, key: str = "speaker_db:main") -> None: ...
 ```
+
+> **关键设计**：`SpeakerRepository` 是**唯一对外 seam**。内部协调 `speaker_db`（dict）、`vector_db`（FAISS）、`speaker_profile`（dict）三者的一致性。调用者无需知道内部有三个存储。
+
+**（6）VectorIndex（FAISS 适配 seam）**
+
+```python
+class VectorIndex(Protocol):
+    def build(self, vectors: np.ndarray, labels: list[str]) -> None: ...
+    def search(self, query: np.ndarray, topk: int = 5) -> list[SearchResult]: ...
+    def add(self, vector: np.ndarray, label: str) -> None: ...
+    def rebuild(self) -> None: ...
+```
+
+> 具体实现为 `FaissVectorIndex`（`src/speaker_db/vector_index.py`）。`repository.py` 中保留 `VectorIndex` 作为 Protocol 别名，便于后续替换为 `IndexIVFFlat` 或其他库（Milvus / Qdrant）而无需修改 `SpeakerRepository`。
+
+**（7）Storage（统一持久化 seam）**
+
+```python
+class Storage(Protocol):
+    def save(self, key: str, data: Any) -> None: ...
+    def load(self, key: str) -> Any: ...
+    def exists(self, key: str) -> bool: ...
+```
+
+实现：
+- `JsonStorage` — metadata、segments、profiles（替换 `diarization/cache.py`, `speaker_profile` 存储）
+- `NpzStorage` — embedding matrices（替换 `embedding/cache.py`）
+- `PickleStorage` — FAISS indices、复杂对象
+- `MemoryStorage` — 测试专用
+
+> **统一 key 命名**：`"segments:bur_3260"`、`"embeddings:bur_3260"`、`"speaker_db:main"`、`"profiles:main"`
 
 ---
 
@@ -170,54 +207,48 @@ data_store = {
 | 文件 | 核心内容 |
 |------|---------|
 | `config.py` | 所有常量（见第 8 节参数表） |
-| `audio/preprocess.py` | `convert_to_wav(input_path, output_path)` FFmpeg 封装；`load_wav(wav_path) -> tuple[np.ndarray, int]`；`crop_segment(wav_array, sr, start, end) -> np.ndarray`；`rms_normalize(wav_array, target_rms=0.1)` |
+| `src/core/types.py` | **【新增】**核心 dataclass：SpeakerSegment, SpeakerProfile, SpeakerData 等 |
+| `src/core/pool.py` | **【新增】**EmbeddingPool 封装 |
+| `src/core/storage.py` | **【新增】**Storage Protocol + Adapter |
+| `src/core/repository.py` | **【新增】**SpeakerRepository + VectorIndex Protocol（骨架） |
+| `src/core/pipeline.py` | 【已清理】原 Stage Protocol + Pipeline 死代码已删除 |
+| `src/audio/preprocess.py` | `convert_to_wav()`, `load_wav()`, `crop_segment()`, `rms_normalize()` |
 | `requirements.txt` | `torch`, `pyannote.audio`, `speechbrain`, `scikit-learn`, `faiss-cpu`, `openai-whisper`, `numpy`, `scipy`, `soundfile`, `pytest`, `pytest-cov` + 翻译模型依赖 |
 
-**验证标准**：输入任意格式音频，输出符合规范的 wav。
+**验证标准**：输入任意格式音频，输出符合规范的 wav；`SpeakerSegment` 和 `EmbeddingPool` 单元测试通过。
 
 ---
 
 ### Phase 2: 说话人分段
 
-**目标**：输入 wav，输出带时间戳的说话人片段。
+**目标**：输入 wav，输出带时间戳的说话人片段（`list[SpeakerSegment]`）。
 
 | 文件 | 核心内容 |
 |------|---------|
-| `diarization/segment.py` | `run_diarization(wav_path, model_name="pyannote/speaker-diarization-3.1", token=None, device=None) -> Annotation`；封装 `pyannote/speaker-diarization` |
-| `diarization/postprocess.py` | `merge_short_segments(annotation, min_duration_on=0.3, min_duration_off=0.2)`；`annotation_to_segments(annotation, min_duration=1.0) -> list[dict]`（Annotation 转 segments，含预留字段）；`rename_labels(annotation, label_mapping) -> Annotation` |
-| `diarization/cache.py` | `save_segments(file_path, segments)` / `load_segments(file_path)`，JSON 格式缓存 |
+| `src/diarization/segment.py` | `run_diarization(wav_path) -> Annotation`；封装 pyannote |
+| `src/diarization/postprocess.py` | `merge_short_segments(annotation)`；`annotation_to_segments(annotation, min_duration=1.0) -> list[SpeakerSegment]` |
 
-**数据结构**：
-```python
-segments = [
-    {
-        "start": 0.0,
-        "end": 3.2,
-        "duration": 3.2,
-        "local_speaker": "A",
-        "global_speaker": None,
-        "display_name": None,
-        "embedding": None,
-        "text": None,
-        "translation": None,
-    }
-]
-```
-> 字段说明：`global_speaker`, `display_name`, `embedding`, `text`, `translation` 为下游模块预留，初始为 `None`。
+**关键变更**：
+- `annotation_to_segments()` 返回 `list[SpeakerSegment]`（不再是 `list[dict]`）
+- `SpeakerSegment` 的 `global_speaker`, `display_name`, `embedding`, `text`, `translation` 初始为 `None`
+- `segment_id` 和 `file` 由调用方（如 `scripts/build_embedding_pool.py`）在拿到 `list[SpeakerSegment]` 后统一注入
 
-**验证标准**：一段多人对话音频，能正确切分出不同说话人的时间段。
+**验证标准**：一段多人对话音频，能正确切分出不同说话人的 `SpeakerSegment`。
 
 ---
 
 ### Phase 3: 声纹向量提取与归一化
 
-**目标**：从每个语音片段提取 192 维 embedding。
+**目标**：从每个 `SpeakerSegment` 提取 192 维 embedding。
 
 | 文件 | 核心内容 |
 |------|---------|
-| `embedding/extractor.py` | `class EmbeddingExtractor`：初始化 SpeechBrain 预训练模型；`extract(wav_array, sr=16000) -> np.ndarray(192,)`；`extract_segments(wav_path, segments) -> list[dict]`（批量提取） |
-| `embedding/normalize.py` | `l2_normalize(emb) -> emb / np.linalg.norm(emb)` |
-| `embedding/cache.py` | `save_embeddings(file_path, segments)` / `load_embeddings(file_path)`：将带 embedding 的 segments 存为 `.npz` + `.json`；`list_embedding_files(dir_path)` |
+| `src/embedding/extractor.py` | `class EmbeddingExtractor`：`extract(wav_array) -> np.ndarray`；`extract_segments(wav_path, segments: list[SpeakerSegment]) -> list[SpeakerSegment]`（返回新实例，不修改输入） |
+| `src/embedding/normalize.py` | `l2_normalize(emb) -> emb / np.linalg.norm(emb)` |
+
+**关键变更**：
+- `extract_segments()` 输入 `list[SpeakerSegment]`，返回 `list[SpeakerSegment]`（通过 `seg.with_embedding(emb)` 生成不可变副本）
+- 不再需要独立的 `embedding/cache.py` —— 使用 `src/core/storage.py` 中的 `NpzStorage`
 
 **验证标准**：同一人的两个片段，cosine similarity > 0.85；不同人 < 0.5。
 
@@ -225,18 +256,28 @@ segments = [
 
 ### Phase 4: 全局聚类、去重与 Speaker ID 回写
 
-**目标**：跨文件聚合同一说话人，生成全局 SPK_ID，并将结果回写到数据结构。
-
-**前置步骤**：先运行 `scripts/build_embedding_pool.py` 批量提取 embedding，得到按文件保存的 `.npz` 缓存。
+**目标**：跨文件聚合同一说话人，生成全局 SPK_ID，并回写到 `EmbeddingPool`。
 
 | 文件 | 核心内容 |
 |------|---------|
-| `clustering/pool.py` | `build_embedding_pool(npz_dir) -> embedding_pool`：从所有 `.npz` 文件加载，构建全局分层结构（`segments` + `matrix` + `meta_index`） |
-| `clustering/cluster.py` | 聚类 + 去重 + SPK_ID 回写。`agg_clustering(embeddings, distance_threshold=0.3) -> labels`；去重（cosine > 0.95）用矩阵向量化 dot product；将 `labels` 映射为 `SPK_{label}` 回写到 `embedding_pool.segments[i].global_speaker` |
+| `scripts/build_embedding_pool.py` | 批量：wav → diarization → embedding → `EmbeddingPool` → `.npz` 缓存（通过 `NpzStorage`） |
+| `src/clustering/pool.py` | `build_embedding_pool(npz_dir, segment_dir) -> EmbeddingPool`：从所有 `.npz` + `.json` 文件加载，构建 `EmbeddingPool` |
+| `src/clustering/cluster.py` | **两层聚类**：`agg_clustering(embeddings, distance_threshold=0.3, centroid_threshold=0.35, min_cluster_size=3) -> labels`。第一层用保守阈值做 `AgglomerativeClustering`（保证纯度），第二层按类 centroid 合并相近的簇（减少碎片化）；去重用矩阵向量化 dot product；`pool.apply_labels(labels)` 回写 |
+
+**关键变更**：
+- 批量提取后的中间数据通过 `NpzStorage` 持久化，key 如 `"embeddings:bur_3260"`
+- `cluster.py` 操作的是 `EmbeddingPool` 对象，聚类后通过 `pool.apply_labels(labels)` 返回**新 pool**
+- 不再直接操作裸 `embedding_pool["segments"][i]["global_speaker"]`
 
 **验证标准**：
-1. 同一人在 A.wav 和 B.wav 中的片段，被分配到同一个 cluster label。
-2. 回写后，`embedding_pool` 中的 `global_speaker` 字段已填充。
+1. 同一人在 A.wav 和 B.wav 中的片段，被分配到同一个 cluster label；两层聚类不要求所有片段被第一层直接合并，允许经第二层 centroid 合并后归入同一 speaker。
+2. 回写后，`EmbeddingPool.filter_by_speaker("SPK_0")` 能正确返回该 speaker 的所有 segments。
+
+**2026-05-16 聚类策略与实测结论**：
+- SLR80 train（2330 条，20 位女性说话人）真实测试：`distance_threshold=0.30` 单层聚类产生 562 个类（100% 纯度），`0.55` 产生 24 个类但纯度降至 97.2%。
+- 采用两层聚类 `thr=0.30, cthr=0.35, min_cluster_size=3` 后，类数降至 21，纯度 98.8%。这是当前数据上**泛化与精度最平衡的参数**。
+- **关键发现**：该数据集 `intra-speaker max distance=0.854`，`inter-speaker min distance=0.323`，说明 ECAPA-TDNN 在缅甸语女性说话人上类内/类间分布存在显著重叠；单层高阈值容易过拟合到该统计特性，两层策略用保守第一层 + centroid 第二层更稳健。
+- 策略原则：**不追求 100% 纯度**（会过拟合到当前数据集），优先保证未知数据上的稳定性。
 
 ---
 
@@ -246,14 +287,16 @@ segments = [
 
 | 文件 | 核心内容 |
 |------|---------|
-| `speaker_db/builder.py` | `build_speaker_db(embedding_pool) -> speaker_db`：按 global_speaker 分组，加权平均（时长做权重）计算 center，L2 归一化；去异常 embedding；**保留全量原始 embeddings**（用于后续动态更新重新计算 center） |
-| `speaker_db/profile.py` | 管理 `speaker_profile`；`assign_name(spk_id, name)` |
-| `speaker_db/storage.py` | `save_speaker_db(db, path)` / `load_speaker_db(path)`；pickle / numpy 格式 |
-| `speaker_db/vector_index.py` | `class VectorIndex`：`build(vectors, spk_ids) -> faiss.IndexFlatIP`；`search(query_emb, topk=5) -> results`；`add(new_vector, spk_id)`；`rebuild()` |
+| `src/speaker_db/vector_index.py` | `class FaissVectorIndex`：实现 `build()`, `search()`, `add()`, `rebuild()`；`VectorIndex` 保留为 Protocol 别名 |
+| `src/speaker_db/builder.py` | **【废弃】**功能已并入 `src/core/repository.py` |
+| `src/speaker_db/profile.py` | **【废弃】**功能已并入 `src/core/repository.py` |
+| `src/speaker_db/updater.py` | **【废弃】**功能已并入 `src/core/repository.py` |
+| `src/speaker_db/storage.py` | **【废弃】**功能已并入 `src/core/storage.py` |
 
 **关键设计**：
 - FAISS 索引中每个 speaker 存入最多 `MAX_EMB=20` 个精选 embedding（不是只存 1 个 center）。
 - 小规模（<10 万向量）使用 `IndexFlatIP`。
+- `SpeakerRepository` 是统一对外接口，内部持有 `FaissVectorIndex` 实例。
 
 **验证标准**：100 个 speaker 的多向量索引，FAISS 检索耗时 < 10ms。
 
@@ -265,10 +308,15 @@ segments = [
 
 | 文件 | 核心内容 |
 |------|---------|
-| `asr/whisper_asr.py` | `transcribe(wav_path, language="my") -> {"segments": [{"start", "end", "text"}]}` |
-| `translation/translator.py` | **【新增】**缅甸语 → 中文翻译模块。加载本地 NMT 模型（如 `Helsinki-NLP/opus-mt-my-zh` 或 mBART），输入缅甸语句子，输出中文翻译。预留 API fallback 接口。 |
+| `src/asr/whisper_asr.py` | `transcribe(wav_path, language="my") -> list[SpeakerSegment]`（返回带 `text` 字段的 SpeakerSegment 列表） |
+| `src/translation/translator.py` | 缅甸语 → 中文翻译模块。加载本地 NMT 模型，输入缅甸语句子，输出中文翻译。预留 API fallback 接口。 |
 
 **注意**：翻译模块需离线可用，优先加载本地模型。如本地模型效果不佳，可预留 API 接口（Google Translate / 百度翻译）作为 fallback。
+
+**2026-05-16 真实测试发现**：
+- Whisper `tiny` 在真实 SLR80 dev wav 上可以跑通，但缅甸语识别质量不可用，输出出现中英混杂与乱码式幻觉；因此 Whisper 只能作为工程连通性验证，不能作为缅甸语 ASR 主模型。
+- 当前翻译实现默认使用 `facebook/nllb-200-distilled-600M`（`mya_Mymr -> zho_Hans`），方案方向可保留，但本机缓存不完整，且当前依赖组合加载 NLLB 时出现 `scale_embedding expected int, got bool`。翻译真实质量尚未验证。
+- Phase 6 的优先级应调整为：先替换/接入专用缅甸语 ASR（优先试 ModelScope `damo/speech_UniASR_asr_2pass-my-16k-common-vocab696-pytorch` 或 SLR80/XLS-R fine-tuned 模型），再修 NLLB/翻译 fallback。若 ASR 文本错误，后续翻译质量没有评价意义。
 
 ---
 
@@ -278,30 +326,16 @@ segments = [
 
 | 文件 | 核心内容 |
 |------|---------|
-| `asr/align.py` | `assign_speaker_to_segments(whisper_segments, diarization_annotation, translations) -> list[dict]` |
+| `src/asr/align.py` | `align_segments(whisper_segments: list[SpeakerSegment], diarization_annotation) -> list[SpeakerSegment]` |
 
 **对齐逻辑**：
 1. 对每条 Whisper segment，用 `annotation.crop(Segment(start, end)).argmax()` 找占比最大的 speaker。
-2. **【新增】边界处理**：
+2. **边界处理**：
    - 如果 `crop` 结果为空 → `speaker = "UNKNOWN"`
-   - 如果 `end - start < 0.5` → `speaker = "IGNORE"`（片段太短，speaker 归属不可靠）
-3. 将对应的中文翻译挂在该 segment 上。
+   - 如果 `end - start < 0.5` → `speaker = "IGNORE"`
+3. 将对应的中文翻译挂在 segment 上（通过 `seg.with_text(text, translation)`）。
 
-**输出数据结构**：
-```python
-result = {
-  "file1.wav": [
-    {
-      "start": 0.0,
-      "end": 3.2,
-      "speaker": "SPK_0",
-      "display_name": "张三",
-      "text": "မင်္ဂလာပါ",
-      "translation": "你好"
-    }
-  ]
-}
-```
+**输出数据结构**：`dict[str, list[SpeakerSegment]]`（文件 → segments）。
 
 **验证标准**：识别的文本能正确归属到对应的 global_speaker，翻译结果语义通顺。
 
@@ -313,15 +347,16 @@ result = {
 
 | 文件 | 核心内容 |
 |------|---------|
-| `recognition/identify.py` | `identify_speaker(segment_emb, vector_index, speaker_db) -> {"speaker", "score", "confidence"}` |
-| `recognition/verify.py` | `topk_consistency(topk_results, k=5, min_consistency=4) -> bool`：**5 个中至少 4 个一致**才算通过；支持占比判断 |
+| `src/recognition/identify.py` | **【废弃】**已并入 `SpeakerRepository.identify()` |
+| `src/recognition/verify.py` | `topk_consistency(topk_results, k=5, min_consistency=4) -> bool` |
 
-**双阈值判断逻辑**：
+**双阈值判断逻辑**（在 `SpeakerRepository.identify()` 内部实现）：
 ```python
-if score >= T_high(0.7) and topk_consistent:
-    → 高置信，更新现有 speaker
+results = self._vector_index.search(query_emb, topk=TOPK)
+if topk_consistent(results) and results[0].score >= T_HIGH:
+    -> 高置信，返回现有 speaker
 else:
-    → 低置信 / 未知，新建 Speaker（分配新 SPK_ID，加入向量库）
+    -> 低置信 / 未知，由调用方决定新建 Speaker
 ```
 
 **验证标准**：已知说话人的新音频，识别准确率 > 90%；未知说话人，拒绝识别（不强行归类）。
@@ -334,13 +369,13 @@ else:
 
 | 文件 | 核心内容 |
 |------|---------|
-| `speaker_db/updater.py` | `update_speaker_embedding(spk_id, new_emb, duration, max_emb=20)`：
-1. **质量过滤**：`duration < 2.0` → skip；`cosine_similarity(new_emb, mean_emb) > 0.95` → skip（去重）
-2. **更新 `speaker_db`**：新 embedding 加入 `speaker_db[spk_id]["embeddings"]`（全量原始数据），用全量 embeddings 重新计算加权 center
-3. **更新 `vector_db`**：新 embedding 加入 FAISS 精选向量池（每人最多 `MAX_EMB=20` 个），超限时删除与 `center` cosine similarity 最小（离中心最远）的 embedding
-4. **重建索引**：重新构建 FAISS `IndexFlatIP` 索引
-- **【预留】**`quality_score` 接口（暂不实现，预留参数位） |
-| `pipeline.py` | `build_pipeline(audio_files) -> data_store`：建库主流程；`recognize_pipeline(new_audio) -> results`：识别主流程 |
+| `src/pipeline.py` | `build_pipeline(embedding_dir, label_strategy) -> SpeakerRepository`：建库主流程；`recognize_pipeline(new_audio, repo, extractor, ...) -> list[SpeakerSegment]`：识别主流程（已过滤 IGNORE 并回填 display_name） |
+
+**`SpeakerRepository.update_speaker()` 逻辑**：
+1. **质量过滤**：`duration < UPDATE_MIN_DURATION` → skip；`cosine_similarity(new_emb, center) > UPDATE_DEDUP_THRESHOLD` → skip
+2. **更新 `speaker_db`**：新 embedding 加入全量原始数据，重新计算加权 center
+3. **更新 `vector_db`**：新 embedding 加入 FAISS 精选向量池（每人最多 `MAX_EMB` 个），超限时删除离 center 最远的 embedding
+4. **重建索引**：调用 `VectorIndex.rebuild()`
 
 **验证标准**：多次识别同一人新音频后，该中心向量稳定性提升（同类样本 similarity 升高）。
 
@@ -353,7 +388,7 @@ else:
 | 文件 | 核心内容 |
 |------|---------|
 | `main.py` | `argparse` 支持两个子命令：`build`（建库）、`recognize`（识别） |
-| `tests/` | 每个模块至少一个单元测试；`test_pipeline.py` 端到端测试 |
+| `tests/` | 每个模块至少一个单元测试；`test_pipeline.py` 端到端测试；`tests/test_core_*.py` 覆盖 core 模块 |
 
 **验证标准**：
 - `python main.py build --input_dir ./audio_samples/` 成功建库
@@ -364,31 +399,50 @@ else:
 ## 四、模块依赖关系
 
 ```
-audio/preprocess.py
-       |
-       v
-diarization/segment.py -> diarization/postprocess.py
-       |
-       v
-embedding/extractor.py -> embedding/normalize.py
-       |
-       v
-clustering/pool.py -> clustering/cluster.py
-       |
-       v
-speaker_db/builder.py -> speaker_db/vector_index.py
-       |                     |
-       v                     v
-asr/whisper_asr.py    translation/translator.py
-       |                     |
-       +-------> asr/align.py <---------+
-       |                               |
-       +-------> pipeline.py <---------+
-       |                               |
-       +-------> recognition/identify.py -> recognition/verify.py
-       |                               |
-       +-------> speaker_db/updater.py  |
+src/core/
+  ├── types.py        <- 所有模块依赖（最底层）
+  ├── pool.py         <- types
+  ├── storage.py      <- types
+  └── repository.py   <- types, pool, storage
+
+业务模块依赖：
+  src/audio/preprocess.py
+         |
+         v
+  src/diarization/segment.py -> src/diarization/postprocess.py
+         |                            |
+         |                            v
+         |                      list[SpeakerSegment]
+         |                            |
+         v                            v
+  src/embedding/extractor.py -----> SpeakerSegment.with_embedding()
+         |
+         v
+  EmbeddingPool (src/core/pool.py)
+         |
+         v
+  src/clustering/cluster.py
+         |
+         v
+  SpeakerRepository.build_from_pool() (src/core/repository.py)
+         |
+         +---> src/speaker_db/vector_index.py (FaissVectorIndex)
+         |
+         +---> src/asr/whisper_asr.py
+         |           |
+         |           v
+         +---> src/asr/align.py <---------+
+         |                                 |
+         +---> src/pipeline.py <-----------+
+         |                                 |
+         +---> SpeakerRepository.identify()  (Phase 8)
+         |                                 |
+         +---> SpeakerRepository.update_speaker() (Phase 9)
 ```
+
+**关键规则**：
+- `src/core/` 不依赖任何业务模块（audio, diarization, embedding, asr 等）。
+- 业务模块可以依赖 `src/core/`，但不可以互相交叉依赖（如 asr 不应直接 import diarization）。
 
 ---
 
@@ -397,14 +451,22 @@ asr/whisper_asr.py    translation/translator.py
 ### 5.1 当前数据集（SLR80）
 
 - **来源**：OpenSLR SLR80 缅甸语 ASR 数据集
-- **性质**：单说话人朗读数据（20 位女性说话人，~2530 条，4 小时）
-- **当前位置**：`speech_asr_slr80_my_trainsets/`（根目录）
+- **性质**：单说话人朗读数据（20 位女性说话人，2528 条公开语音，约 4 小时）
+- **当前位置**：`data/raw/burmese_asr/`（根目录）
+- **真实 speaker 标识**：文件名形如 `bur_0366_5281755035.wav`，其中 `0366` 是 speaker id；构建 SLR80 基准声纹库时必须使用该前缀作为 `global_speaker`。
 - **用途**：
-  - ✅ **ASR 准确率测试**（WER/CER）
-  - ✅ **翻译质量验证**（缅甸语 → 中文，人工抽检）
-  - ⚠️ **声纹提取通路验证**（代码能跑通，但单说话人文件 trivial）
-  - ❌ **无法验证 diarization**（没有多人对话场景）
-  - ❌ **无法真实验证声纹识别准确率**（缺乏多人对话测试数据）
+  - **ASR 准确率测试**（WER/CER）
+  - **翻译质量验证**（缅甸语 → 中文，人工抽检）
+  - **声纹提取通路验证**（代码能跑通，但单说话人文件 trivial）
+  - **无法验证 diarization**（没有多人对话场景）
+  - **可验证“已知说话人识别”基准**：用 train 按文件名前缀建 20 人库，用 dev/test 做闭集识别评估；但仍无法验证真实多人对话 diarization。
+
+**2026-05-16 真实测试发现**：
+- raw split 数量与 CSV 对齐：train/dev/test 分别为 2330/100/100 个 wav。
+- `missing_train.txt`、`missing_dev.txt`、`missing_test.txt` 当前列出的文件实际存在，这些文件是错误或过期诊断产物，不能再作为缺失文件依据。
+- 使用默认无监督聚类从 train embeddings 建库时，2528 个 segments 被聚成 681 个 speaker；这与 SLR80 真实 20 个 speaker 不符，该库应判定为无效。
+- 使用文件名前缀建 20 人库后，dev/test 闭集识别结果为：dev 88/102（86.27%），test 92/105（87.62%）；高置信结果未出现误识，失败主要是低置信拒识。
+- 已新增 `slr80_filename` 标签策略：SLR80 建库应使用 `--label_strategy slr80_filename`，通用未知数据才使用 `cluster`。
 
 ### 5.2 多人对话数据（后续准备）
 
@@ -420,7 +482,7 @@ asr/whisper_asr.py    translation/translator.py
 |------|------|------|
 | Pyannote / SpeechBrain 模型下载慢或需 huggingface token | 中 | 提前配置 token，使用国内镜像或本地缓存 |
 | FAISS 在 Windows 上安装困难 | 中 | 用 `faiss-cpu`，如仍失败换预编译包 |
-| 聚类 threshold 调参困难 | 高 | 先用 0.3 默认值，预留配置文件可调，后期用标注数据校准 |
+| 聚类 threshold 调参困难 | 高 | **已解决**：采用两层聚类策略，第一层保守阈值（0.30）保纯度，第二层 centroid 合并（0.35）减碎片；不追求 100% 纯度以避免过拟合到当前数据集统计特性；SLR80 实测最佳参数 `thr=0.30, cthr=0.35, min=3` |
 | Whisper 缅甸语 ASR 准确率不足 | 高 | Whisper 对缅甸语支持较弱，可能需要 fine-tune 或使用专用缅甸语 ASR 模型 |
 | 缅甸语 → 中文翻译模型稀缺 | 中 | 优先尝试 `Helsinki-NLP/opus-mt-my-zh` 或 mBART，如效果差再调 API |
 | 长音频（>1小时）内存爆炸 | 中 | 分段处理，流式读取 |
@@ -439,7 +501,9 @@ asr/whisper_asr.py    translation/translator.py
 | `MIN_DURATION_ON` | 0.3 | 最短语音段，低于则删除 |
 | `MIN_DURATION_OFF` | 0.2 | 最短静音段，低于则合并 |
 | `EMBEDDING_DIM` | 192 | 声纹向量维度（ECAPA-TDNN） |
-| `DISTANCE_THRESHOLD` | 0.3 | 聚类距离阈值（cosine distance），对应 similarity 0.7 |
+| `DISTANCE_THRESHOLD` | 0.30 | 第一层聚类距离阈值（cosine distance），保守值，保证纯度优先 |
+| `CENTROID_THRESHOLD` | 0.35 | 第二层 centroid 合并阈值（cosine distance）；同一 speaker 的多个子簇 centroid 距离低于此值时合并 |
+| `MIN_CLUSTER_SIZE` | 3 | 第二层最小类大小，低于此值的类被视为噪声，合并到最近的合法类 |
 | `DEDUP_THRESHOLD` | 0.95 | 去重相似度阈值 |
 | `MAX_EMB` | 20 | 每个 speaker 最大保留 embedding 数 |
 | `TOPK` | 5 | FAISS 检索 TopK |
@@ -463,7 +527,7 @@ voice-detection/
 |-- pipeline.py                        # 主流程封装
 |
 |-- scripts/                           # 批量工具脚本
-|   |-- build_embedding_pool.py       # 批量：wav → diarization → embedding
+|   |-- build_embedding_pool.py       # 批量：wav → diarization → embedding → NpzStorage
 |
 |-- data/
 |   |-- raw/
@@ -472,8 +536,8 @@ voice-detection/
 |   |-- processed/                     # 处理后的中间数据
 |   |   |-- burmese_asr/
 |   |   |   |-- wav/                  # 标准化后的 wav
-|   |   |   |-- segments/             # diarization 结果缓存（JSON）
-|   |   |   |-- embeddings/           # 提取的 embedding（npz + json）
+|   |   |   |-- segments/             # diarization 结果缓存（JSON，通过 JsonStorage）
+|   |   |   |-- embeddings/           # 提取的 embedding（NPZ，通过 NpzStorage）
 |   |-- output/                        # 最终输出
 |   |   |-- results/                  # 识别结果 JSON
 |
@@ -484,47 +548,57 @@ voice-detection/
 |   |-- translation/
 |
 |-- src/
+|   |-- core/                          # 【新增】核心数据结构与 seams
+|   |   |-- __init__.py
+|   |   |-- types.py                   # SpeakerSegment, SpeakerProfile, SpeakerData 等 dataclass
+|   |   |-- pool.py                    # EmbeddingPool（替代裸 dict embedding_pool）
+|   |   |-- storage.py                 # Storage Protocol + Json/Npz/Pickle/Memory Storage
+|   |   |-- repository.py              # SpeakerRepository + VectorIndex Protocol
+|   |   |-- pipeline.py                # 【已清理】原 Stage Protocol + Pipeline 死代码已删除
 |   |-- audio/
 |   |   |-- preprocess.py
 |   |   |-- __init__.py
 |   |-- diarization/
 |   |   |-- segment.py
 |   |   |-- postprocess.py
-|   |   |-- cache.py                   # save_segments / load_segments
 |   |   |-- __init__.py
+|   |   |-- cache.py                   # 【废弃，逐步替换为 core/storage.py】
 |   |-- embedding/
 |   |   |-- extractor.py
 |   |   |-- normalize.py
-|   |   |-- cache.py                   # save_embeddings / load_embeddings
 |   |   |-- __init__.py
+|   |   |-- cache.py                   # 【废弃，逐步替换为 core/storage.py】
 |   |-- clustering/
-|   |   |-- pool.py                    # 从 npz 构建全局 embedding_pool
+|   |   |-- pool.py                    # 【新增】从 NpzStorage + JsonStorage 加载 EmbeddingPool
 |   |   |-- cluster.py                 # 聚类 + 去重 + 分配 SPK_ID
 |   |   |-- __init__.py
 |   |-- speaker_db/
-|   |   |-- builder.py
-|   |   |-- profile.py
-|   |   |-- storage.py
-|   |   |-- vector_index.py
-|   |   |-- updater.py
+|   |   |-- vector_index.py            # FaissVectorIndex 实现；VectorIndex 保留为 Protocol 别名
 |   |   |-- __init__.py
+|   |   |-- builder.py                 # 【废弃，功能并入 repository.py】
+|   |   |-- profile.py                 # 【废弃，功能并入 repository.py】
+|   |   |-- updater.py                 # 【废弃，功能并入 repository.py】
+|   |   |-- storage.py                 # 【废弃，功能并入 core/storage.py】
 |   |-- asr/
 |   |   |-- whisper_asr.py
 |   |   |-- align.py
 |   |   |-- __init__.py
 |   |-- translation/
-|   |   |-- translator.py              # 缅甸语 → 中文翻译
+|   |   |-- translator.py
 |   |   |-- __init__.py
 |   |-- recognition/
-|   |   |-- identify.py
-|   |   |-- verify.py
+|   |   |-- identify.py                # 【废弃，功能并入 repository.py】
+|   |   |-- verify.py                  # TopK consistency 判断
 |   |   |-- __init__.py
 |
 |-- tests/
+|   |-- test_core_types.py             # 【新增】SpeakerSegment, SpeakerProfile 不可变性测试
+|   |-- test_core_pool.py              # 【新增】EmbeddingPool 懒构建、apply_labels 测试
+|   |-- test_core_storage.py           # 【新增】Json/Npz/Memory Storage 测试
+|   |-- test_phase4_10_compat.py       # 【新增】Phase 4-10 兼容性与集成测试
 |   |-- test_audio.py
 |   |-- test_diarization.py
 |   |-- test_embedding.py
-|   |-- test_embedding_cache.py
 |   |-- test_clustering.py
 |   |-- test_speaker_db.py
 |   |-- test_asr.py
@@ -534,6 +608,19 @@ voice-detection/
 |
 |-- IMPLEMENTATION_PLAN.md
 ```
+
+### 废弃文件说明
+
+| 旧文件 | 替代方案 | 迁移策略 |
+|--------|---------|---------|
+| `diarization/cache.py` | `core/storage.py` 的 `JsonStorage` | 功能已迁移至 `JsonStorage`；旧文件保留仅作向后兼容参考 |
+| `embedding/cache.py` | `core/storage.py` 的 `NpzStorage` | 功能已迁移至 `NpzStorage`；旧文件保留仅作向后兼容参考 |
+| `speaker_db/storage.py` | `core/storage.py` 的 `PickleStorage` / `JsonStorage` | 功能已迁移至 `core/storage.py` |
+| `speaker_db/builder.py` | `core/repository.py` 的 `SpeakerRepository.build_from_pool()` | 功能已迁移至 Repository |
+| `speaker_db/profile.py` | `core/repository.py` 的 `SpeakerRepository.assign_name()` | 功能已迁移至 Repository |
+| `speaker_db/updater.py` | `core/repository.py` 的 `SpeakerRepository.update_speaker()` | 功能已迁移至 Repository |
+| `recognition/identify.py` | `core/repository.py` 的 `SpeakerRepository.identify()` | 功能已迁移至 Repository |
+| `src/core/pipeline.py` 的 `Stage`/`Pipeline` | 已删除 | 死代码，无替代；业务流直接由 `pipeline.py` 中的 `build_pipeline` / `recognize_pipeline` 函数承担 |
 
 ---
 
@@ -550,5 +637,6 @@ voice-detection/
 
 ---
 
-*计划重构日期：2026-05-14*
-*基于 grill-me 需求对齐结果*
+*计划版本：V2.1*
+*重构日期：2026-05-16*
+*变更：所有裸 dict 数据结构封装为不可变 dataclass；新增 src/core/ 统一 seams；全局聚类升级为两层策略（保守阈值 + centroid 合并）。*

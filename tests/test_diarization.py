@@ -8,6 +8,9 @@ from unittest import mock
 import pytest
 from pyannote.core import Annotation, Segment
 
+from dataclasses import FrozenInstanceError
+
+from src.core.types import SpeakerSegment
 from src.diarization.cache import load_segments, save_segments
 from src.diarization.postprocess import annotation_to_segments, merge_short_segments, rename_labels
 from src.diarization.segment import run_diarization
@@ -24,10 +27,9 @@ class TestRunDiarization:
             tmp_path = f.name
 
         try:
-            with mock.patch(
-                "src.diarization.segment.Pipeline.from_pretrained",
-                side_effect=RuntimeError("mock error"),
-            ):
+            mock_pipeline_cls = mock.Mock()
+            mock_pipeline_cls.from_pretrained.side_effect = RuntimeError("mock error")
+            with mock.patch("src.diarization.segment._load_pipeline_class", return_value=mock_pipeline_cls):
                 with pytest.raises(RuntimeError, match="Failed to load"):
                     run_diarization(tmp_path)
         finally:
@@ -39,10 +41,9 @@ class TestRunDiarization:
             tmp_path = f.name
 
         try:
-            with mock.patch(
-                "src.diarization.segment.Pipeline.from_pretrained",
-                return_value=None,
-            ):
+            mock_pipeline_cls = mock.Mock()
+            mock_pipeline_cls.from_pretrained.return_value = None
+            with mock.patch("src.diarization.segment._load_pipeline_class", return_value=mock_pipeline_cls):
                 with pytest.raises(RuntimeError, match="returned None"):
                     run_diarization(tmp_path)
         finally:
@@ -60,10 +61,11 @@ class TestRunDiarization:
         mock_pipeline.return_value = mock_annotation
 
         try:
-            with mock.patch(
-                "src.diarization.segment.Pipeline.from_pretrained",
-                return_value=mock_pipeline,
-            ):
+            mock_pipeline_cls = mock.Mock()
+            mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+            with mock.patch("src.diarization.segment._load_pipeline_class", return_value=mock_pipeline_cls), \
+                mock.patch("src.diarization.segment._select_device", return_value="cpu"), \
+                mock.patch("src.diarization.segment._load_audio", return_value=("waveform", 16000)):
                 result = run_diarization(tmp_path, device="cpu")
                 assert isinstance(result, Annotation)
                 assert len(list(result.itertracks())) == 1
@@ -134,56 +136,57 @@ class TestAnnotationToSegments:
         ann[Segment(1.0, 3.0)] = "B"
         result = annotation_to_segments(ann, min_duration=1.0)
         assert len(result) == 1
-        assert result[0]["local_speaker"] == "B"
-        assert result[0]["duration"] == 2.0
-        assert result[0]["global_speaker"] is None
-        assert result[0]["embedding"] is None
+        assert isinstance(result[0], SpeakerSegment)
+        assert result[0].local_speaker == "B"
+        assert result[0].duration == 2.0
+        assert result[0].global_speaker is None
+        assert result[0].embedding is None
 
     def test_sorted_output(self):
         ann = Annotation()
         ann[Segment(5.0, 7.0)] = "A"
         ann[Segment(1.0, 3.0)] = "B"
         result = annotation_to_segments(ann, min_duration=1.0)
-        assert result[0]["start"] == 1.0
-        assert result[1]["start"] == 5.0
+        assert result[0].start == 1.0
+        assert result[1].start == 5.0
 
-    def test_data_store_fields_present(self):
+    def test_speaker_segments_are_immutable(self):
         ann = Annotation()
         ann[Segment(0.0, 2.0)] = "A"
         result = annotation_to_segments(ann)
         assert len(result) == 1
         seg = result[0]
-        assert "start" in seg
-        assert "end" in seg
-        assert "duration" in seg
-        assert "local_speaker" in seg
-        assert seg["global_speaker"] is None
-        assert seg["display_name"] is None
-        assert seg["embedding"] is None
-        assert seg["text"] is None
-        assert seg["translation"] is None
+        assert isinstance(seg, SpeakerSegment)
+        assert seg.segment_id == ""
+        assert seg.file == ""
+        assert seg.global_speaker is None
+        assert seg.display_name is None
+        assert seg.embedding is None
+        assert seg.text is None
+        assert seg.translation is None
+        with pytest.raises(FrozenInstanceError):
+            seg.local_speaker = "B"
 
 
 class TestCache:
     def test_roundtrip(self):
         segments = [
-            {
-                "start": 0.0,
-                "end": 3.2,
-                "duration": 3.2,
-                "local_speaker": "A",
-                "global_speaker": None,
-                "display_name": None,
-                "embedding": None,
-                "text": None,
-                "translation": None,
-            },
+            SpeakerSegment(
+                segment_id="sample_0000",
+                file="sample.wav",
+                start=0.0,
+                end=3.2,
+                local_speaker="A",
+            ),
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "segments.json")
             save_segments(path, segments)
             loaded = load_segments(path)
-            assert loaded == segments
+            assert loaded[0].start == segments[0].start
+            assert loaded[0].local_speaker == segments[0].local_speaker
+            assert loaded[0].file == "sample.wav"
+            assert loaded[0].segment_id == "sample_0000"
 
     def test_load_missing(self):
         with pytest.raises(FileNotFoundError):

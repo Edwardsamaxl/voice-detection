@@ -21,15 +21,26 @@ from glob import glob
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv()
+
+# Workaround: force pyannote.audio import before speechbrain to avoid
+# circular import / LazyModule issues between torchvision and speechbrain.
+try:
+    from pyannote.audio import Pipeline
+except Exception:
+    pass
+
+from dataclasses import replace
 
 from config import MIN_DURATION, MIN_DURATION_OFF, MIN_DURATION_ON, SAMPLE_RATE
 from src.audio.preprocess import convert_to_wav, load_wav
-from src.diarization.cache import load_segments, save_segments
+from src.core.storage import JsonStorage, NpzStorage
+from src.core.types import SpeakerSegment
 from src.diarization.postprocess import annotation_to_segments, merge_short_segments
 from src.diarization.segment import run_diarization
-from src.embedding.cache import save_embeddings
 from src.embedding.extractor import EmbeddingExtractor
 
 logging.basicConfig(
@@ -38,6 +49,32 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _segment_to_meta(segment: SpeakerSegment) -> dict:
+    """Serialize a SpeakerSegment to a JSON-safe dict without embedding."""
+    from dataclasses import asdict
+
+    record = asdict(segment)
+    record.pop("embedding", None)
+    record["has_embedding"] = segment.embedding is not None
+    return record
+
+
+def _meta_to_segment(record: dict) -> SpeakerSegment:
+    """Deserialize a dict to a SpeakerSegment (embedding loaded separately)."""
+    return SpeakerSegment(
+        segment_id=str(record.get("segment_id") or ""),
+        file=str(record.get("file") or ""),
+        start=float(record["start"]),
+        end=float(record["end"]),
+        local_speaker=str(record.get("local_speaker") or "UNKNOWN"),
+        global_speaker=record.get("global_speaker"),
+        display_name=record.get("display_name"),
+        embedding=None,
+        text=record.get("text"),
+        translation=record.get("translation"),
+    )
 
 
 def process_file(
@@ -57,17 +94,18 @@ def process_file(
         A dict with keys: file, status, segment_count, error (optional).
     """
     basename = Path(wav_path).stem
-    embedding_path = os.path.join(output_dir, f"{basename}.npz")
-    segment_path = os.path.join(segment_dir, f"{basename}.json")
+    json_storage = JsonStorage(segment_dir)
+    npz_storage = NpzStorage(output_dir)
 
-    if skip_existing and os.path.exists(embedding_path):
+    if skip_existing and npz_storage.exists(basename):
         return {"file": wav_path, "status": "skipped", "segment_count": 0}
 
     try:
         # Step 1: Load or run diarization
-        if os.path.exists(segment_path):
+        if json_storage.exists(basename):
             logger.info(f"[{basename}] Loading cached diarization...")
-            segments = load_segments(segment_path)
+            meta_list = json_storage.load(basename)
+            segments = [_meta_to_segment(m) for m in meta_list]
         else:
             logger.info(f"[{basename}] Running diarization...")
             annotation = run_diarization(wav_path, token=hf_token)
@@ -77,23 +115,25 @@ def process_file(
                 min_duration_off=min_duration_off,
             )
             segments = annotation_to_segments(merged, min_duration=min_duration)
-            save_segments(segment_path, segments)
+            meta_list = [_segment_to_meta(seg) for seg in segments]
+            json_storage.save(basename, meta_list)
 
         if not segments:
             logger.warning(f"[{basename}] No segments found after filtering.")
             return {"file": wav_path, "status": "empty", "segment_count": 0}
 
         # Enrich segments with file key and segment_id for global pooling
-        for i, seg in enumerate(segments):
-            seg["file"] = basename
-            seg["segment_id"] = f"{basename}_{i:04d}"
+        segments = [
+            replace(seg, file=basename, segment_id=f"{basename}_{i:04d}")
+            for i, seg in enumerate(segments)
+        ]
 
         # Step 2: Extract embeddings
         logger.info(f"[{basename}] Extracting embeddings for {len(segments)} segments...")
         segments_with_emb = extractor.extract_segments(wav_path, segments)
 
         # Filter out segments where embedding failed
-        valid_segments = [s for s in segments_with_emb if s.get("embedding") is not None]
+        valid_segments = [s for s in segments_with_emb if s.embedding is not None]
         failed_count = len(segments_with_emb) - len(valid_segments)
         if failed_count > 0:
             logger.warning(f"[{basename}] {failed_count} segments failed embedding extraction.")
@@ -102,7 +142,13 @@ def process_file(
             return {"file": wav_path, "status": "empty", "segment_count": 0}
 
         # Step 3: Save embeddings
-        save_embeddings(embedding_path, valid_segments)
+        meta_list = [_segment_to_meta(seg) for seg in valid_segments]
+        json_storage.save(basename, meta_list)
+        embs = [seg.embedding for seg in valid_segments if seg.embedding is not None]
+        npz_storage.save(
+            basename,
+            {"embeddings": np.stack(embs) if embs else np.empty((0, 0), dtype=np.float32)},
+        )
 
         return {
             "file": wav_path,

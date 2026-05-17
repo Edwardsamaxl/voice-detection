@@ -2,6 +2,8 @@
 
 from pyannote.core import Annotation, Segment
 
+from src.core.types import SpeakerSegment
+
 
 def rename_labels(
     annotation: Annotation,
@@ -71,29 +73,21 @@ def merge_short_segments(
 def annotation_to_segments(
     annotation: Annotation,
     min_duration: float = 1.0,
-) -> list[dict]:
-    """Convert a diarization Annotation to data_store segment format.
-
-    Each segment dict includes placeholder fields for downstream pipeline
-    stages: global_speaker, display_name, embedding, text, translation.
-    """
+) -> list[SpeakerSegment]:
+    """Convert a diarization Annotation to V2 speaker segments."""
     segments = []
-    for segment, track, speaker in annotation.itertracks(yield_label=True):
+    for segment, _track, speaker in annotation.itertracks(yield_label=True):
         duration = segment.end - segment.start
         if duration >= min_duration:
             segments.append(
-                {
-                    "start": round(segment.start, 3),
-                    "end": round(segment.end, 3),
-                    "duration": round(duration, 3),
-                    "local_speaker": speaker,
-                    "global_speaker": None,
-                    "display_name": None,
-                    "embedding": None,
-                    "text": None,
-                    "translation": None,
-                }
+                SpeakerSegment(
+                    segment_id="",
+                    file="",
+                    start=round(segment.start, 3),
+                    end=round(segment.end, 3),
+                    local_speaker=str(speaker),
+                )
             )
 
-    segments.sort(key=lambda x: x["start"])
+    segments.sort(key=lambda x: x.start)
     return segments

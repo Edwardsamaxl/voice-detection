@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from config import EMBEDDING_DIM, MODELS_DIR, SAMPLE_RATE
+from src.core.types import SpeakerSegment
 
 
 class EmbeddingExtractor:
@@ -30,6 +31,7 @@ class EmbeddingExtractor:
         """
         if savedir is None:
             savedir = str(Path(MODELS_DIR) / "speechbrain")
+        os.makedirs(savedir, exist_ok=True)
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.embedding_dim = EMBEDDING_DIM
@@ -42,7 +44,12 @@ class EmbeddingExtractor:
                 f"SpeechBrain is not installed. Please install it: {e}"
             )
         except Exception as e:
-            raise RuntimeError(f"Failed to load SpeechBrain encoder: {e}")
+            raise RuntimeError(
+                "Failed to load SpeechBrain encoder. Use the clean Windows CPU "
+                "venv from README and verify model cache/access with "
+                f"scripts/doctor.py. model_source={model_source!r}, "
+                f"savedir={savedir!r}. Original error: {e}"
+            )
 
     def _load_classifier(self, model_source: str, savedir: str) -> Any:
         """Load the SpeechBrain encoder. Extracted for testability."""
@@ -113,36 +120,24 @@ class EmbeddingExtractor:
         g = math.gcd(orig_sr, target_sr)
         return signal.resample_poly(wav_array, up=target_sr // g, down=orig_sr // g)
 
-    def extract_segments(self, wav_path: str, segments: list[dict]) -> list[dict]:
-        """Extract embeddings for a list of segments from a single wav file.
-
-        Args:
-            wav_path: Path to the wav file.
-            segments: List of segment dicts with 'start' and 'end' keys.
-
-        Returns:
-            New list of segments with 'embedding' field populated.
-        """
+    def extract_segments(self, wav_path: str, segments: list[SpeakerSegment]) -> list[SpeakerSegment]:
+        """Extract embeddings for V2 speaker segments from a single wav file."""
         from src.audio.preprocess import load_wav, crop_segment, rms_normalize
 
         wav, sr = load_wav(wav_path)
 
-        new_segments: list[dict] = []
+        new_segments: list[SpeakerSegment] = []
         for seg in segments:
-            new_seg = dict(seg)
-            start = new_seg.get("start", 0.0)
-            end = new_seg.get("end", 0.0)
-            audio_slice = crop_segment(wav, sr, start, end)
+            audio_slice = crop_segment(wav, sr, seg.start, seg.end)
             audio_slice = rms_normalize(audio_slice)
 
             if audio_slice.size == 0:
-                warnings.warn(f"Empty segment {start}-{end}, skipping embedding")
-                new_seg["embedding"] = None
+                warnings.warn(f"Empty segment {seg.start}-{seg.end}, skipping embedding")
+                new_segments.append(seg.with_embedding(None))
             else:
                 if sr != SAMPLE_RATE:
                     audio_slice = self._resample(audio_slice, sr, SAMPLE_RATE)
-                new_seg["embedding"] = self.extract(audio_slice, sr=SAMPLE_RATE)
-            new_segments.append(new_seg)
+                new_segments.append(seg.with_embedding(self.extract(audio_slice, sr=SAMPLE_RATE)))
 
         return new_segments
 
@@ -155,18 +150,42 @@ class EmbeddingExtractor:
         """Extract embeddings for all segments of a single file in data_store.
 
         Deprecated: Use extract_segments() for new code.
-
-        Args:
-            data_store: Unified data store mapping file keys to segment lists.
-            file_key: The key in data_store to process (e.g., "file1.wav").
-            wav_path: Path to the corresponding wav file.
-
-        Returns:
-            New data_store with embeddings populated for the given file_key.
         """
         if file_key not in data_store:
             raise KeyError(f"File key '{file_key}' not found in data_store")
 
+        segments = [
+            SpeakerSegment(
+                segment_id=str(seg.get("segment_id") or f"{file_key}_{idx:04d}"),
+                file=str(seg.get("file") or file_key),
+                start=float(seg.get("start", 0.0)),
+                end=float(seg.get("end", 0.0)),
+                local_speaker=str(seg.get("local_speaker") or "UNKNOWN"),
+                global_speaker=seg.get("global_speaker"),
+                display_name=seg.get("display_name"),
+                embedding=seg.get("embedding"),
+                text=seg.get("text"),
+                translation=seg.get("translation"),
+            )
+            for idx, seg in enumerate(data_store[file_key])
+        ]
+        enriched = self.extract_segments(wav_path, segments)
+
         new_store = dict(data_store)
-        new_store[file_key] = self.extract_segments(wav_path, data_store[file_key])
+        new_store[file_key] = [
+            {
+                "segment_id": seg.segment_id,
+                "file": seg.file,
+                "start": seg.start,
+                "end": seg.end,
+                "duration": seg.duration,
+                "local_speaker": seg.local_speaker,
+                "global_speaker": seg.global_speaker,
+                "display_name": seg.display_name,
+                "embedding": seg.embedding,
+                "text": seg.text,
+                "translation": seg.translation,
+            }
+            for seg in enriched
+        ]
         return new_store

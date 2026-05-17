@@ -9,6 +9,7 @@ import soundfile as sf
 from unittest.mock import MagicMock, patch
 
 from config import EMBEDDING_DIM
+from src.core.types import SpeakerSegment
 from src.embedding.extractor import EmbeddingExtractor
 from src.embedding.normalize import l2_normalize
 
@@ -151,22 +152,19 @@ class TestEmbeddingExtractor:
             data = np.random.randn(16000 * 2).astype(np.float32)
             sf.write(wav_path, data, 16000)
 
-            data_store = {
-                "test.wav": [
-                    {"start": 0.0, "end": 1.0, "local_speaker": "A"},
-                    {"start": 1.0, "end": 2.0, "local_speaker": "B"},
-                ]
-            }
-            result = extractor.extract_for_file(data_store, "test.wav", wav_path)
+            segments = [
+                SpeakerSegment("test_0000", "test.wav", 0.0, 1.0, "A"),
+                SpeakerSegment("test_0001", "test.wav", 1.0, 2.0, "B"),
+            ]
+            result = extractor.extract_segments(wav_path, segments)
 
-        assert "test.wav" in result
-        segments = result["test.wav"]
-        assert len(segments) == 2
-        assert segments[0]["local_speaker"] == "A"
-        assert segments[0]["embedding"] is not None
-        assert segments[0]["embedding"].shape == (EMBEDDING_DIM,)
-        assert segments[1]["local_speaker"] == "B"
-        assert segments[1]["embedding"] is not None
+        assert len(result) == 2
+        assert result[0].local_speaker == "A"
+        assert result[0].embedding is not None
+        assert result[0].embedding.shape == (EMBEDDING_DIM,)
+        assert result[1].local_speaker == "B"
+        assert result[1].embedding is not None
+        assert segments[0].embedding is None
         assert mock_classifier.encode_batch.call_count == 2
 
     @patch.object(EmbeddingExtractor, "_load_classifier")
@@ -183,12 +181,11 @@ class TestEmbeddingExtractor:
             data = np.random.randn(16000 * 2).astype(np.float32)
             sf.write(wav_path, data, 8000)
 
-            data_store = {"test.wav": [{"start": 0.0, "end": 1.0}]}
-            result = extractor.extract_for_file(data_store, "test.wav", wav_path)
+            segments = [SpeakerSegment("test_0000", "test.wav", 0.0, 1.0, "A")]
+            result = extractor.extract_segments(wav_path, segments)
 
-        segments = result["test.wav"]
-        assert len(segments) == 1
-        emb = segments[0]["embedding"]
+        assert len(result) == 1
+        emb = result[0].embedding
         assert emb is not None
         assert emb.shape == (EMBEDDING_DIM,)
         # ensure resampling happened: 8000Hz * 1s = 8000 samples, resampled to 16000
@@ -206,11 +203,11 @@ class TestEmbeddingExtractor:
             data = np.random.randn(16000).astype(np.float32)
             sf.write(wav_path, data, 16000)
 
-            data_store = {"test.wav": [{"start": 2.0, "end": 1.0}]}
+            segments = [SpeakerSegment("test_0000", "test.wav", 2.0, 1.0, "A")]
             with pytest.warns(UserWarning, match="Empty segment"):
-                result = extractor.extract_for_file(data_store, "test.wav", wav_path)
+                result = extractor.extract_segments(wav_path, segments)
 
-        assert result["test.wav"][0]["embedding"] is None
+        assert result[0].embedding is None
 
     @patch.object(EmbeddingExtractor, "_load_classifier")
     def test_extract_for_file_missing_key(self, mock_load):
