@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -19,105 +18,59 @@ from config import PROCESSED_DIR
 def cmd_build(args: argparse.Namespace) -> None:
     """Build speaker repository from embeddings."""
     from src.core.repository import SpeakerRepository
-    from src.core.storage import JsonStorage, PickleStorage
+    from src.core.storage import JsonStorage, NpzStorage
     from src.speaker_db.vector_index import FaissVectorIndex
-    from pipeline import build_pipeline
+    from pipeline import build_pipeline, save_repository
 
     embedding_dir = args.embedding_dir or os.path.join(PROCESSED_DIR, "burmese_asr", "embeddings")
     output_dir = args.output_dir or os.path.join(PROCESSED_DIR, "speaker_db")
 
     vector_index = FaissVectorIndex()
-    repo = SpeakerRepository(vector_index=vector_index, storage=JsonStorage(output_dir))
+    repo = SpeakerRepository(
+        vector_index=vector_index,
+        storage=JsonStorage(output_dir),
+        vector_storage=NpzStorage(output_dir),
+    )
     repo = build_pipeline(embedding_dir, label_strategy=args.label_strategy, repo=repo)
 
-    os.makedirs(output_dir, exist_ok=True)
-    repo.save("speaker_db:main")
-
-    pickle_storage = PickleStorage(output_dir)
-    pickle_storage.save(
-        "vector_index:main",
-        {
-            "vectors": vector_index.vectors,
-            "labels": vector_index.labels,
-        },
-    )
+    save_repository(repo, vector_index, output_dir)
 
     print(f"Built repository with {len(repo.all_speakers())} speakers at {output_dir}")
 
 
 def cmd_recognize(args: argparse.Namespace) -> None:
     """Recognize speakers in a new audio file."""
-    from src.audio.preprocess import convert_to_wav
-    from src.core.repository import SpeakerRepository
-    from src.core.storage import JsonStorage, PickleStorage
     from src.diarization.segment import _load_pipeline_class
+    from src.embedding.extractor import EmbeddingExtractor
+    from src.translation.translator import Translator
+    from pipeline import run_recognition
 
     # pyannote must be imported before SpeechBrain on this Windows CPU stack,
     # otherwise SpeechBrain lazy imports can trip pyannote/torchvision loading.
     _load_pipeline_class()
 
-    from src.embedding.extractor import EmbeddingExtractor
-    from src.speaker_db.vector_index import FaissVectorIndex
-    from src.translation.translator import Translator
-    from pipeline import recognize_pipeline
-
     repo_dir = args.repo_dir or os.path.join(PROCESSED_DIR, "speaker_db")
 
-    vector_index = FaissVectorIndex()
-    repo = SpeakerRepository(vector_index=vector_index, storage=JsonStorage(repo_dir))
-    repo.load("speaker_db:main")
+    extractor = EmbeddingExtractor(device=args.device)
+    translator = Translator(device=args.device) if not args.no_translate else None
 
-    pickle_storage = PickleStorage(repo_dir)
-    if pickle_storage.exists("vector_index:main"):
-        data = pickle_storage.load("vector_index:main")
-        vector_index.build(data["vectors"], data["labels"])
+    result = run_recognition(
+        input_path=args.input,
+        repo_dir=repo_dir,
+        extractor=extractor,
+        translator=translator,
+        asr_model=args.asr_model,
+        hf_token=args.hf_token,
+        device=args.device,
+        asr_backend=args.asr_backend,
+    )
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"Result saved to {args.output}")
     else:
-        repo.rebuild()
-
-    input_path = args.input
-    wav_path = input_path
-    temp_wav = None
-    if not input_path.lower().endswith(".wav"):
-        temp_wav = tempfile.mktemp(suffix=".wav")
-        convert_to_wav(input_path, temp_wav)
-        wav_path = temp_wav
-
-    try:
-        extractor = EmbeddingExtractor(device=args.device)
-        translator = Translator(device=args.device) if not args.no_translate else None
-
-        segments = recognize_pipeline(
-            wav_path=wav_path,
-            repo=repo,
-            extractor=extractor,
-            translator=translator,
-            asr_model=args.asr_model,
-            hf_token=args.hf_token,
-            device=args.device,
-            asr_backend=args.asr_backend,
-        )
-
-        result = [
-            {
-                "start": round(seg.start, 3),
-                "end": round(seg.end, 3),
-                "speaker": seg.global_speaker or seg.local_speaker or "UNKNOWN",
-                "display_name": seg.display_name,
-                "text": seg.text,
-                "translation": seg.translation,
-            }
-            for seg in segments
-        ]
-
-        if args.output:
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            print(f"Result saved to {args.output}")
-        else:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-    finally:
-        if temp_wav and os.path.exists(temp_wav):
-            os.remove(temp_wav)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def main() -> None:

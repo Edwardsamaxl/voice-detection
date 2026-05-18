@@ -35,8 +35,10 @@ class SpeakerSegment:
     global_speaker: str | None = None
     display_name: str | None = None
     embedding: np.ndarray | None = None
+    score: float | None = None
     text: str | None = None
     translation: str | None = None
+    sr: int = 16000
 
     @property
     def duration(self) -> float:
@@ -54,6 +56,12 @@ class SpeakerSegment:
     def with_local_speaker(self, speaker: str) -> SpeakerSegment:
         return replace(self, local_speaker=speaker)
 
+    def with_score(self, score: float | None) -> SpeakerSegment:
+        return replace(self, score=score)
+
+    def with_sr(self, sr: int) -> SpeakerSegment:
+        return replace(self, sr=sr)
+
     def with_text(self, text: str, translation: str | None = None) -> SpeakerSegment:
         return replace(self, text=text, translation=translation)
 
@@ -70,12 +78,25 @@ class SpeakerProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class VectorEntry:
+    """A single retained embedding for a speaker."""
+
+    spk_id: str
+    embedding: np.ndarray
+    duration: float
+
+
+@dataclass(frozen=True, slots=True)
 class SpeakerData:
-    """Aggregated speaker data: center vector, raw embeddings, profile."""
+    """Aggregated speaker metadata: center vector, selected embeddings, and profile.
+
+    V2.3: embeddings and durations kept in SpeakerData for self-contained speaker_db.
+    """
 
     spk_id: str
     center: np.ndarray
-    embeddings: list[np.ndarray]
+    embedding_count: int
+    embeddings: list[np.ndarray] | None = None
     durations: list[float] | None = None
     profile: SpeakerProfile | None = None
 

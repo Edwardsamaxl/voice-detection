@@ -8,6 +8,7 @@ import pytest
 from pyannote.core import Annotation, Segment
 
 from src.asr.align import align_segments
+from src.asr.text_normalize import normalize_burmese_asr_text, normalize_for_cer, text_to_ctc_tokens
 from src.asr.whisper_asr import transcribe
 from src.core.types import SpeakerSegment
 
@@ -69,6 +70,21 @@ class TestTranscribe:
             transcribe("audio.wav", download_root="/custom/root")
 
         mock_load.assert_called_once_with("base", download_root="/custom/root")
+
+
+class TestBurmeseAsrNormalize:
+    def test_removes_terminal_dataset_marker(self):
+        assert normalize_burmese_asr_text("မင်္ဂလာပါ ဒေါ်လာ") == "မင်္ဂလာပါ"
+
+    def test_removes_only_isolated_terminal_la(self):
+        assert normalize_burmese_asr_text("မင်္ဂ လာ") == "မင်္ဂ"
+        assert normalize_burmese_asr_text("မင်္ဂလာ") == "မင်္ဂလာ"
+
+    def test_cer_normalization_drops_spaces(self):
+        assert normalize_for_cer("မင်္ဂ လာ") == "မင်္ဂ"
+
+    def test_ctc_training_text_uses_word_delimiter(self):
+        assert text_to_ctc_tokens("မင်္ဂလာ ပါ") == "မင်္ဂလာ|ပါ"
 
 
 class TestAlignSegments:

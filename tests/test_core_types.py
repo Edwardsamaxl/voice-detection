@@ -50,8 +50,24 @@ def test_with_text_and_translation():
 
 def test_speaker_data_creation():
     center = np.array([1.0, 0.0], dtype=np.float32)
-    data = SpeakerData(spk_id="SPK_0", center=center, embeddings=[center])
+    data = SpeakerData(spk_id="SPK_0", center=center, embedding_count=1)
     assert data.spk_id == "SPK_0"
+    assert data.embedding_count == 1
+
+
+def test_with_score_returns_new_instance():
+    seg = SpeakerSegment(segment_id="s1", file="a.wav", start=0.0, end=1.0, local_speaker="A")
+    new_seg = seg.with_score(0.85)
+    assert new_seg is not seg
+    assert new_seg.score == 0.85
+    assert seg.score is None
+
+
+def test_with_sr_returns_new_instance():
+    seg = SpeakerSegment(segment_id="s1", file="a.wav", start=0.0, end=1.0, local_speaker="A")
+    new_seg = seg.with_sr(16000)
+    assert new_seg is not seg
+    assert new_seg.sr == 16000
 
 
 def test_identification_result():

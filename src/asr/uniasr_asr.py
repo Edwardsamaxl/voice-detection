@@ -19,6 +19,10 @@ def _get_audio_duration(wav_path: str) -> float:
 def transcribe_uniasr(
     wav_path: str,
     model_dir: str | None = None,
+    decoding_model: str = "offline",
+    beam_size: int = 5,
+    token_num_relax: int = 5,
+    penalty: float = 0.0,
 ) -> list[SpeakerSegment]:
     """Transcribe audio with UniASR and return segments as SpeakerSegments.
 
@@ -31,6 +35,11 @@ def transcribe_uniasr(
         wav_path: Path to the input WAV file.
         model_dir: Local directory containing the UniASR model.  Defaults to
             ``config.UNIASR_MODEL_DIR``.
+        decoding_model: UniASR decoding mode, usually ``"offline"`` for
+            highest accuracy.
+        beam_size: Beam-search width.
+        token_num_relax: Token length relaxation used by UniASR decoding.
+        penalty: Decoding penalty.
 
     Returns:
         List of ``SpeakerSegment`` with *local_speaker* set to ``"UNKNOWN"``
@@ -50,7 +59,13 @@ def transcribe_uniasr(
         task=Tasks.auto_speech_recognition,
         model=model_dir,
     )
-    result = inference(wav_path)
+    result = inference(
+        wav_path,
+        decoding_model=decoding_model,
+        beam_size=beam_size,
+        token_num_relax=token_num_relax,
+        penalty=penalty,
+    )
 
     # ModelScope FunASR pipelines return a dict like:
     #   {"text": "...", "text_punc": "...",

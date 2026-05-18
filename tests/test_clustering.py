@@ -118,7 +118,7 @@ class TestAggClustering:
         embeddings = np.vstack([cluster_a, cluster_b, cluster_c])
         labels_one_stage = agg_clustering(embeddings, distance_threshold=0.3, centroid_threshold=None)
         labels_two_stage = agg_clustering(
-            embeddings, distance_threshold=0.3, centroid_threshold=0.05, min_cluster_size=1
+            embeddings, distance_threshold=0.3, centroid_threshold=0.05
         )
         assert len(np.unique(labels_two_stage)) <= len(np.unique(labels_one_stage))
 

@@ -6,9 +6,9 @@ from unittest import mock
 
 from config import EMBEDDING_DIM, MAX_EMB, TOPK
 from src.core.pool import EmbeddingPool
-from src.core.repository import SpeakerRepository
+from src.core.repository import SpeakerRepository, VectorDb
 from src.core.storage import MemoryStorage
-from src.core.types import IdentificationResult, SpeakerData, SpeakerProfile, SpeakerSegment
+from src.core.types import IdentificationResult, SpeakerData, SpeakerProfile, SpeakerSegment, VectorEntry
 from src.speaker_db.vector_index import FaissVectorIndex, vectors_from_speaker_db
 
 
@@ -127,7 +127,7 @@ class TestSpeakerRepositoryBuildFromPool:
         repo.build_from_pool(pool, max_emb=3)
         spk = repo.get_speaker("SPK_0")
         assert spk is not None
-        assert len(spk.embeddings) == 3
+        assert spk.embedding_count == 3
 
 
 class TestSpeakerRepositoryIdentify:
@@ -137,12 +137,15 @@ class TestSpeakerRepositoryIdentify:
         labels = list(speakers.keys())
         index.build(vectors, labels)
         repo = SpeakerRepository(vector_index=index)
-        # Manually inject speakers so identify works end-to-end
+        # Manually inject speakers and vector_db so identify works end-to-end
         for spk_id, vec in speakers.items():
             repo._speakers[spk_id] = SpeakerData(
                 spk_id=spk_id,
                 center=vec,
-                embeddings=[vec],
+                embedding_count=1,
+            )
+            repo._vector_db.set_entries(
+                spk_id, [VectorEntry(spk_id=spk_id, embedding=vec, duration=1.0)]
             )
         return repo
 
@@ -161,7 +164,11 @@ class TestSpeakerRepositoryIdentify:
         index.build(vectors, ["SPK_0"] * 5)
         repo = SpeakerRepository(vector_index=index)
         repo._speakers["SPK_0"] = SpeakerData(
-            spk_id="SPK_0", center=vec, embeddings=[vec] * 5
+            spk_id="SPK_0", center=vec, embedding_count=5
+        )
+        repo._vector_db.set_entries(
+            "SPK_0",
+            [VectorEntry(spk_id="SPK_0", embedding=vec, duration=1.0) for _ in range(5)],
         )
         result = repo.identify(vec)
         assert result.speaker == "SPK_0"
@@ -226,7 +233,7 @@ class TestSpeakerRepositoryAddSpeaker:
         durations = [1.0] * 25
         repo.add_speaker("SPK_0", embeddings, durations)
         spk = repo.get_speaker("SPK_0")
-        assert len(spk.embeddings) == MAX_EMB
+        assert spk.embedding_count == MAX_EMB
 
 
 class TestSpeakerRepositoryUpdateSpeaker:
@@ -258,7 +265,7 @@ class TestSpeakerRepositoryUpdateSpeaker:
         new_emb[1] = 1.0
         assert repo.update_speaker("SPK_0", new_emb, 5.0) is True
         spk = repo.get_speaker("SPK_0")
-        assert len(spk.embeddings) == 2
+        assert spk.embedding_count == 2
 
 
 class TestSpeakerRepositoryAssignName:
@@ -281,15 +288,19 @@ class TestSpeakerRepositoryAssignName:
 class TestSpeakerRepositorySaveLoad:
     def test_roundtrip_with_memory_storage(self):
         storage = MemoryStorage()
-        repo = SpeakerRepository(vector_index=FaissVectorIndex(), storage=storage)
+        repo = SpeakerRepository(
+            vector_index=FaissVectorIndex(), storage=storage, vector_storage=storage
+        )
         emb = np.zeros(EMBEDDING_DIM, dtype=np.float32)
         emb[0] = 1.0
         repo.add_speaker("SPK_0", [emb], [1.0])
         repo.assign_name("SPK_0", "Alice")
-        repo.save("db:v1")
+        repo.save("db:v1", "vector_db:v1")
 
-        repo2 = SpeakerRepository(vector_index=FaissVectorIndex(), storage=storage)
-        repo2.load("db:v1")
+        repo2 = SpeakerRepository(
+            vector_index=FaissVectorIndex(), storage=storage, vector_storage=storage
+        )
+        repo2.load("db:v1", "vector_db:v1")
         spk = repo2.get_speaker("SPK_0")
         assert spk is not None
         assert spk.profile is not None

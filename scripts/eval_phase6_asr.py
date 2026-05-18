@@ -26,10 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 DEFAULT_MODEL = (
     PROJECT_ROOT
-    / ".codex_realtest"
-    / "modelscope"
-    / "iic"
-    / "speech_UniASR_asr_2pass-my-16k-common-vocab696-pytorch"
+    / "models"
+    / "uni_asr"
 )
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "raw" / "burmese_asr"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / ".codex_realtest" / "phase6_asr_eval"
@@ -181,13 +179,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         start = time.perf_counter()
-        param_dict = {
+        decoding_params = {
             "decoding_model": args.decoding_model,
             "token_num_relax": args.token_num_relax,
             "beam_size": args.beam_size,
             "penalty": args.penalty,
         }
-        raw = asr(str(infer_path), param_dict=param_dict)
+        raw = asr(str(infer_path), **decoding_params)
         seconds = time.perf_counter() - start
         hyp = normalize_for_metric(
             extract_text(raw),
@@ -330,4 +328,6 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     evaluate(parse_args())

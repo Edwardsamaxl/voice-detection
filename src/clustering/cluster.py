@@ -62,33 +62,21 @@ def _merge_by_centroid(
     embeddings: np.ndarray,
     labels: np.ndarray,
     centroid_threshold: float,
-    min_cluster_size: int = 1,
 ) -> np.ndarray:
     """Merge clusters whose centroids are within cosine distance threshold."""
     centroids = _compute_centroids(embeddings, labels)
-
-    valid_labels = [
-        lbl for lbl, (_, count) in centroids.items() if count >= min_cluster_size
-    ]
-    noise_labels = [
-        lbl for lbl, (_, count) in centroids.items() if count < min_cluster_size
-    ]
-
-    if not valid_labels:
-        unique = np.unique(labels)
-        mapping = {int(u): i for i, u in enumerate(unique)}
-        return np.array([mapping[int(l)] for l in labels], dtype=int)
+    unique_labels = [int(lbl) for lbl in np.unique(labels)]
 
     merged_map: dict[int, int] = {}
     next_id = 0
 
-    for i, lbl_a in enumerate(valid_labels):
+    for i, lbl_a in enumerate(unique_labels):
         if lbl_a in merged_map:
             continue
         merged_map[lbl_a] = next_id
         centroid_a = centroids[lbl_a][0]
 
-        for lbl_b in valid_labels[i + 1 :]:
+        for lbl_b in unique_labels[i + 1 :]:
             if lbl_b in merged_map:
                 continue
             dist = _cosine_distance(centroid_a, centroids[lbl_b][0])
@@ -100,25 +88,6 @@ def _merge_by_centroid(
     for old_lbl, new_lbl in merged_map.items():
         final_labels[labels == old_lbl] = new_lbl
 
-    for noise_lbl in noise_labels:
-        noise_mask = labels == noise_lbl
-        if not np.any(noise_mask):
-            continue
-        noise_embs = embeddings[noise_mask]
-        noise_centroid = np.mean(noise_embs, axis=0)
-        norm = np.linalg.norm(noise_centroid)
-        if norm > 0:
-            noise_centroid = noise_centroid / norm
-
-        best_lbl = valid_labels[0]
-        best_dist = float("inf")
-        for vl in valid_labels:
-            d = _cosine_distance(noise_centroid, centroids[vl][0])
-            if d < best_dist:
-                best_dist = d
-                best_lbl = vl
-        final_labels[noise_mask] = merged_map[best_lbl]
-
     return final_labels
 
 
@@ -126,13 +95,14 @@ def agg_clustering(
     embeddings: np.ndarray,
     distance_threshold: float = DISTANCE_THRESHOLD,
     centroid_threshold: float | None = None,
-    min_cluster_size: int = 1,
 ) -> np.ndarray:
     """Cluster embeddings with cosine-distance agglomerative clustering.
 
     When *centroid_threshold* is provided, a second merge stage is applied:
     clusters whose centroids are within *centroid_threshold* cosine distance
     are merged.  This yields far fewer fragments than a single threshold.
+    No minimum cluster size is enforced; small fragments are resolved by the
+    second-stage centroid merge.
     """
     if embeddings.size == 0:
         return np.array([], dtype=int)
@@ -151,9 +121,7 @@ def agg_clustering(
     labels = model.fit_predict(embeddings)
 
     if centroid_threshold is not None and centroid_threshold > 0:
-        labels = _merge_by_centroid(
-            embeddings, labels, centroid_threshold, min_cluster_size
-        )
+        labels = _merge_by_centroid(embeddings, labels, centroid_threshold)
 
     return labels
 
@@ -162,14 +130,12 @@ def assign_global_speakers(
     pool: EmbeddingPool,
     distance_threshold: float = DISTANCE_THRESHOLD,
     centroid_threshold: float | None = None,
-    min_cluster_size: int = 1,
 ) -> EmbeddingPool:
     """Assign SPK_<label> IDs to all segments in a V2 embedding pool."""
     labels = agg_clustering(
         pool.to_matrix(),
         distance_threshold=distance_threshold,
         centroid_threshold=centroid_threshold,
-        min_cluster_size=min_cluster_size,
     )
     return pool.apply_labels([int(label) for label in labels])
 

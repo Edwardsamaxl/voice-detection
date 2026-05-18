@@ -75,7 +75,6 @@ for thr in [0.25, 0.30, 0.35]:
             all_embs,
             distance_threshold=thr,
             centroid_threshold=cthr,
-            min_cluster_size=3,
         )
         n_clusters = len(np.unique(labels))
         purities = []

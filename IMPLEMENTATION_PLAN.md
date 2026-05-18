@@ -1,7 +1,7 @@
 # 语音处理与声纹识别系统 — 实现计划（V2.1 封装版）
 
 > **目标读者**：实现 Agent。本文档基于与负责人的需求对齐结果编写，实现时请严格遵循本文档，如有歧义优先以本文档为准。
-> **版本**：V2.1（2026-05-16）— 将所有裸 dict 数据结构封装为不可变 dataclass 与类接口。
+> **版本**：V2.3（2026-05-18）— 输出字段扩展（segment_id, file, local_speaker, duration, sr, score, precision, embedding）；speaker_db / vector_db 持久化拆分；识别流程升级为两层比对 + FAISS 全局一致性校验（center 粗排 → FAISS Top-K 检索 → `topk_consistency` 5 选 4）；聚类取消 `min_cluster_size` 限制，由两层聚类自然消解碎片；**识别阈值经三组 leave-out 测试校准：`T_LOW=0.50`（快速拒识）、`T_HIGH=0.65`（最终确认）**。
 
 ---
 
@@ -21,28 +21,46 @@
 
 最终形态：输入一段新音频，系统能输出**谁**在**什么时间**说了**什么**（缅甸语），以及**中文翻译**是什么。
 
-### 1.2 输出示例
+### 1.2 输出示例（V2.2 扩展字段）
 
 ```json
 [
   {
+    "segment_id": "meeting_0012_0000",
+    "file": "meeting_0012.wav",
     "start": 0.0,
     "end": 3.2,
-    "speaker": "SPK_0",
+    "duration": 3.2,
+    "sr": 16000,
+    "local_speaker": "SPEAKER_00",
+    "global_speaker": "SPK_0",
     "display_name": "张三",
+    "score": 0.823,
     "text": "မင်္ဂလာပါ",
-    "translation": "你好"
-  },
-  {
-    "start": 3.5,
-    "end": 7.1,
-    "speaker": "SPK_1",
-    "display_name": "UNKNOWN",
-    "text": "ခင်ဗျား နာမည် ဘယ်လို ခေါ် လဲ",
-    "translation": "你叫什么名字"
+    "translation": "你好",
+    "precision": null,
+    "embedding": [0.0123, -0.0456, ...]
   }
 ]
 ```
+
+**字段说明（ recognize 输出）**：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `segment_id` | `SpeakerSegment.segment_id` | 加工后的唯一标识，格式 `{basename}_{seq:04d}` |
+| `file` | `SpeakerSegment.file` | 来源音频文件名 |
+| `start` / `end` | diarization | 起止时间（秒） |
+| `duration` | derived | `end - start` |
+| `sr` | preprocess | 采样率，固定 16000（ffmpeg 已标准化） |
+| `local_speaker` | pyannote | 原始 diarization 标签，如 `SPEAKER_00` |
+| `global_speaker` | clustering / identify | 全局 speaker ID，如 `SPK_0`、`BUR_0366`、`UNKNOWN` |
+| `display_name` | `SpeakerProfile.name` | 人名，未标注时为 `null` |
+| `score` | `IdentificationResult.score` | 说话人识别置信度（余弦相似度，范围 [-1, 1]）；`UNKNOWN` 时为 `null` |
+| `text` | ASR | 缅甸语识别文本 |
+| `translation` | NLLB | 中文翻译，未启用时为 `null` |
+| `precision` | eval | 文本准确度（如 WER/CER），需有参考文本时计算；无参考时为 `null` |
+| `embedding` | extractor | 当前语段的 192 维声纹向量（float32 list）|
 
 ### 1.3 核心能力清单
 
@@ -68,7 +86,7 @@ src/core/
   ├── types.py          → SpeakerSegment, SpeakerProfile, SpeakerData (不可变 dataclass)
   ├── pool.py           → EmbeddingPool (封装 segments + matrix + meta_index)
   ├── storage.py        → Storage Protocol + JsonStorage / NpzStorage / MemoryStorage
-  ├── repository.py     → SpeakerRepository (统一 seam: speaker_db + vector_db + profile)
+  ├── repository.py     → SpeakerRepository (统一 seam: speaker_db (含精选向量) + vector_index + profile)
   └── pipeline.py       → 【已清理】原 Stage Protocol + Pipeline 死代码已删除
 
 数据流：
@@ -77,8 +95,8 @@ EmbeddingPool（全量原始数据，封装后）
         ↓
 SpeakerRepository.build_from_pool()
         ↓
-  ├─→ speaker_db（聚类后）   → 每人一个 weighted center
-  ├─→ vector_db（FAISS）     → 每人多个精选 embedding（5~20 个）
+  ├─→ speaker_db（识别库）   → 每人一条记录：weighted center + 精选 embeddings（≤20 个）
+  ├─→ vector_db（全量库）    → 聚类前/后的全部原始向量（中间数据，供重新聚类或追溯）
   ├─→ speaker_profile（人名表）→ 显示层（SPK_ID → 姓名）
   └─→ data_store（结果缓存）  → 业务数据（分段 + speaker + text + translation）
 ```
@@ -98,14 +116,18 @@ class SpeakerSegment:
     global_speaker: str | None = None   # 聚类后统一 ID
     display_name: str | None = None
     embedding: np.ndarray | None = None
+    score: float | None = None          # 说话人识别置信度（余弦相似度）
     text: str | None = None
     translation: str | None = None
+    sr: int = 16000                     # 采样率，ffmpeg 标准化后固定 16000
 
     @property
     def duration(self) -> float: ...
     def with_embedding(self, emb) -> SpeakerSegment: ...
     def with_global_speaker(self, spk_id) -> SpeakerSegment: ...
+    def with_score(self, score: float | None) -> SpeakerSegment: ...
     def with_text(self, text, translation=None) -> SpeakerSegment: ...
+    def with_sr(self, sr: int) -> SpeakerSegment: ...
 ```
 
 > **设计原则**：`frozen=True` 保证不可变，下游模块通过 `with_*` 方法派生新版本，杜绝偷偷改字段。
@@ -125,17 +147,22 @@ class EmbeddingPool:
 
 > **关键差异**：旧设计中 `embedding_pool` 是裸 dict，调用者需要手动维护 `matrix` 和 `meta_index` 的一致性。新设计中 `EmbeddingPool` 内部管理这些一致性，`to_matrix()` 只在 dirty 时重建。
 
-**（3）SpeakerData（聚类后中心向量）**
+**（3）SpeakerData（speaker_db 识别库记录）**
 
 ```python
 @dataclass(frozen=True, slots=True)
 class SpeakerData:
     spk_id: str
-    center: np.ndarray          # 加权平均 + L2 归一化后的中心向量
-    embeddings: list[np.ndarray] # 全量原始 embeddings（用于动态更新时重新计算 center）
-    durations: list[float] | None = None  # 各 embedding 对应的片段时长（用于加权 center）
+    center: np.ndarray          # 加权平均 + L2 归一化后的中心向量（用于第一层粗排）
+    embedding_count: int        # 该 speaker 当前保留的向量数
+    embeddings: list[np.ndarray] | None = None   # 精选向量（≤MAX_EMB 个），用于第二层精排和 FAISS 建索引
+    durations: list[float] | None = None         # 精选向量对应的原始片段时长
     profile: SpeakerProfile | None = None
 ```
+
+> **V2.3 架构修正**：精选向量保留在 `SpeakerData` 内，随 `speaker_db` 一并序列化。单个 speaker 最多 20 个精选向量（20 × 192 维 float 数组），JSON 体积完全可控；识别时只需加载 `speaker_db` 即可获得全部识别所需数据（center + 精选向量），无需额外查询全量库。
+>
+> **识别时职责**：`speaker_db` 里的 `center` 用于第一层快速缩小候选范围；`embeddings` 用于构建 FAISS 索引并做 Stage 2 精排和一致性校验。
 
 **（4）SpeakerProfile（人名元数据表）**
 
@@ -149,7 +176,31 @@ class SpeakerProfile:
     created_at: str | None = None
 ```
 
-**（5）SpeakerRepository（统一 seam）**
+**（5）VectorDb（全量原始向量库，V2.3 修正）**
+
+```python
+@dataclass(frozen=True, slots=True)
+class VectorEntry:
+    spk_id: str
+    embedding: np.ndarray
+    duration: float
+
+class VectorDb:
+    """管理聚类前/后的全部原始向量（中间数据）。
+
+    V2.2 错误地把精选向量放到 VectorDb，导致识别时必须加载 vector_db，
+    而 speaker_db 沦为纯元数据壳子。V2.3 修正：
+    - speaker_db: 存 center、embedding_count、embeddings（精选向量）、profile（识别库）
+    - vector_db:  存全部原始向量（聚类前后所有 segments），供重新聚类、追溯或离线分析使用
+
+    在线识别流程只依赖 speaker_db；vector_db 是拓展性质的中间数据，不参与识别。
+    """
+    def add(self, spk_id: str, embedding: np.ndarray, duration: float) -> None: ...
+    def get_entries(self, spk_id: str) -> list[VectorEntry]: ...
+    def all_vectors(self) -> tuple[np.ndarray, list[str]]: ...  # (matrix, labels)
+```
+
+**（6）SpeakerRepository（统一 seam，V2.2 调整）**
 
 ```python
 class SpeakerRepository:
@@ -161,13 +212,27 @@ class SpeakerRepository:
     def get_speaker(self, spk_id: str) -> SpeakerData | None: ...
     def all_speakers(self) -> list[str]: ...
     def rebuild(self) -> None: ...
-    def save(self, key: str = "speaker_db:main") -> None: ...
-    def load(self, key: str = "speaker_db:main") -> None: ...
+    def save(self, speaker_key: str = "speaker_db:main") -> None: ...
+    def load(self, speaker_key: str = "speaker_db:main") -> None: ...
 ```
 
-> **关键设计**：`SpeakerRepository` 是**唯一对外 seam**。内部协调 `speaker_db`（dict）、`vector_db`（FAISS）、`speaker_profile`（dict）三者的一致性。调用者无需知道内部有三个存储。
+> **关键设计**：`SpeakerRepository` 是**唯一对外 seam**。内部持有 `speaker_db`（含精选向量）和 `_vector_index`（FAISS），在线识别只需这两者；`vector_db`（全量原始向量）是可选的中间数据，不挂在 `SpeakerRepository` 内。
+>
+> **V2.3 持久化**：
+> - `speaker_db:main` → JSON：`{spk_id: {"center": [...], "embedding_count": 20, "embeddings": [...], "durations": [...], "profile": {...}}}`（精选向量每人≤20个，JSON 体积可控）
+> - `vector_db:main` → NPZ：`{"spk_ids": [...], "embeddings": (N, 192), "durations": (N,)}`（全量原始向量，中间数据，不参与识别）
+> - `vector_index:main` → Pickle：直接序列化 FAISS `IndexFlatIP` 对象，加载时无需重建即可直接搜索
+>
+> **识别流程（两层比对 + FAISS 一致性校验）**：
+> 1. `identify(query_emb)` 先用 `speaker_db` 中所有人的 `center` 做余弦相似度排序，选出 Top-N 候选；
+> 2. 若最像的候选 center 分数过低（如低于 `T_LOW`），直接返回 `UNKNOWN`，避免无意义的精排；
+> 3. **Stage 2 精排**：调用 `_vector_index.search(query_emb, TOPK)`，从**全部精选向量**中全局检索 Top-K 最近邻；
+> 4. **一致性校验**：用 `topk_consistency(topk_results, k=TOPK, min_consistency=TOPK_CONSISTENCY_MIN)` 判断 Top-K 结果中是否有足够多数（默认 5 选 4）属于**同一个 speaker**；若不一致，返回 `UNKNOWN`；
+> 5. 取一致性指向的 speaker，计算其精选向量与 query 的平均相似度作为最终分数；若 ≥ `T_HIGH` 且该 speaker 在 center 粗排候选中，返回 `KNOWN`；否则返回 `UNKNOWN`。
+>
+> **关键变更**：V2.2 之前 Stage 2 是逐个候选 speaker 取精选向量做内积，"Top-K 一致"天然成立，没有发挥 `topk_consistency` 的作用。新流程改为**先全局 FAISS 检索、再一致性过滤**，真正利用多向量索引的交叉验证能力。
 
-**（6）VectorIndex（FAISS 适配 seam）**
+**（7）VectorIndex（FAISS 适配 seam）**
 
 ```python
 class VectorIndex(Protocol):
@@ -179,7 +244,7 @@ class VectorIndex(Protocol):
 
 > 具体实现为 `FaissVectorIndex`（`src/speaker_db/vector_index.py`）。`repository.py` 中保留 `VectorIndex` 作为 Protocol 别名，便于后续替换为 `IndexIVFFlat` 或其他库（Milvus / Qdrant）而无需修改 `SpeakerRepository`。
 
-**（7）Storage（统一持久化 seam）**
+**（8）Storage（统一持久化 seam）**
 
 ```python
 class Storage(Protocol):
@@ -194,7 +259,42 @@ class Storage(Protocol):
 - `PickleStorage` — FAISS indices、复杂对象
 - `MemoryStorage` — 测试专用
 
-> **统一 key 命名**：`"segments:bur_3260"`、`"embeddings:bur_3260"`、`"speaker_db:main"`、`"profiles:main"`
+> **统一 key 命名**：`"segments:bur_3260"`、`"embeddings:bur_3260"`、`"speaker_db:main"`、`"vector_db:main"`、`"vector_index:main"`、`"profiles:main"`
+
+---
+
+## 2.3 V2.3 架构修正：speaker_db 含精选向量，vector_db 为全量原始库
+
+### 问题
+
+V2.2 把精选向量从 `SpeakerData` 剥离到 `VectorDb`，导致：
+1. 在线识别时必须同时加载 `speaker_db` JSON 和 `vector_db` NPZ，识别库被拆成两份；
+2. `SpeakerRepository` 内部需要同时维护 `_speakers` 和 `_vector_db` 两个存储，职责混乱；
+3. `vector_db` 名字暗示它是向量主库，实际却成了精选向量的附属容器，而真正的全量原始向量反而散落在 `NpzStorage` 的各个 key 里。
+
+### 目标架构（V2.3）
+
+```
+SpeakerRepository（在线识别）
+  ├─ _speakers: dict[str, SpeakerData]      # 识别库：center + 精选向量 + profile
+  └─ _vector_index: FaissVectorIndex        # FAISS 检索索引（由 speaker_db.embeddings 重建）
+
+VectorDb（离线中间数据，不由 SpeakerRepository 持有）
+  └─ 全量原始向量（聚类前/后所有 segments，供重新聚类、追溯、分析）
+```
+
+### 持久化
+
+| 存储 | key | 格式 | 内容 |
+|------|-----|------|------|
+| speaker_db | `speaker_db:main` | JSON | `{spk_id: {"center": [...], "embedding_count": 20, "embeddings": [...], "durations": [...], "profile": {...}}}` |
+| vector_db | `vector_db:main` | NPZ | `{"spk_ids": [...], "embeddings": (N, 192), "durations": (N,)}`（全量原始向量，中间数据）|
+| vector_index | `vector_index:main` | Pickle | FAISS `IndexFlatIP` 缓存（可由 speaker_db 重建）|
+
+### 职责边界
+
+- **speaker_db**：在线识别的唯一数据源。`SpeakerRepository.save/load` 只需读写 `speaker_db:main` 一个文件即可恢复完整的识别能力（center + 精选向量 + profile）。FAISS 索引可由 `speaker_db.embeddings` 重建，因此 `vector_index:main` 只是加速缓存，丢失后可自动重建。
+- **vector_db**：全量原始向量库，由聚类/建库脚本（如 `scripts/build_embedding_pool.py`）写入，供重新聚类或离线分析。`SpeakerRepository` 不持有它，也不依赖它做识别。
 
 ---
 
@@ -262,7 +362,7 @@ class Storage(Protocol):
 |------|---------|
 | `scripts/build_embedding_pool.py` | 批量：wav → diarization → embedding → `EmbeddingPool` → `.npz` 缓存（通过 `NpzStorage`） |
 | `src/clustering/pool.py` | `build_embedding_pool(npz_dir, segment_dir) -> EmbeddingPool`：从所有 `.npz` + `.json` 文件加载，构建 `EmbeddingPool` |
-| `src/clustering/cluster.py` | **两层聚类**：`agg_clustering(embeddings, distance_threshold=0.3, centroid_threshold=0.35, min_cluster_size=3) -> labels`。第一层用保守阈值做 `AgglomerativeClustering`（保证纯度），第二层按类 centroid 合并相近的簇（减少碎片化）；去重用矩阵向量化 dot product；`pool.apply_labels(labels)` 回写 |
+| `src/clustering/cluster.py` | **两层聚类**：`agg_clustering(embeddings, distance_threshold=0.3, centroid_threshold=0.35) -> labels`。第一层用保守阈值做 `AgglomerativeClustering`（保证纯度），第二层按类 centroid 合并相近的簇（减少碎片化）；不设置 `min_cluster_size`，避免新 speaker 因片段不足被丢弃；去重用矩阵向量化 dot product；`pool.apply_labels(labels)` 回写 |
 
 **关键变更**：
 - 批量提取后的中间数据通过 `NpzStorage` 持久化，key 如 `"embeddings:bur_3260"`
@@ -275,7 +375,7 @@ class Storage(Protocol):
 
 **2026-05-16 聚类策略与实测结论**：
 - SLR80 train（2330 条，20 位女性说话人）真实测试：`distance_threshold=0.30` 单层聚类产生 562 个类（100% 纯度），`0.55` 产生 24 个类但纯度降至 97.2%。
-- 采用两层聚类 `thr=0.30, cthr=0.35, min_cluster_size=3` 后，类数降至 21，纯度 98.8%。这是当前数据上**泛化与精度最平衡的参数**。
+- 采用两层聚类 `thr=0.30, cthr=0.35` 后（不设置 `min_cluster_size`，避免丢弃新 speaker 的少量片段），类数降至 21，纯度 98.8%。这是当前数据上**泛化与精度最平衡的参数**。
 - **关键发现**：该数据集 `intra-speaker max distance=0.854`，`inter-speaker min distance=0.323`，说明 ECAPA-TDNN 在缅甸语女性说话人上类内/类间分布存在显著重叠；单层高阈值容易过拟合到该统计特性，两层策略用保守第一层 + centroid 第二层更稳健。
 - 策略原则：**不追求 100% 纯度**（会过拟合到当前数据集），优先保证未知数据上的稳定性。
 
@@ -299,6 +399,14 @@ class Storage(Protocol):
 - `SpeakerRepository` 是统一对外接口，内部持有 `FaissVectorIndex` 实例。
 
 **验证标准**：100 个 speaker 的多向量索引，FAISS 检索耗时 < 10ms。
+
+---
+
+**关于 "vector_db" 与全量原始向量的说明**：
+
+文档中 `speaker_db:main` 存储的是**识别库**，包含每人的中心向量和精选向量（≤20 个 / speaker），用于在线识别的两层比对。
+
+`vector_db:main` 存储的是**全量原始向量**（聚类前/后所有 segments 的 embedding），作为中间数据供重新聚类、追溯或离线分析使用，不参与在线识别。此外，全量原始向量也可由 `NpzStorage` 按文件单独管理（key 如 `"embeddings:bur_3260"`）。
 
 ---
 
@@ -350,49 +458,95 @@ class Storage(Protocol):
 | `src/recognition/identify.py` | **【废弃】**已并入 `SpeakerRepository.identify()` |
 | `src/recognition/verify.py` | `topk_consistency(topk_results, k=5, min_consistency=4) -> bool` |
 
-**双阈值判断逻辑**（在 `SpeakerRepository.identify()` 内部实现）：
+**两层比对 + FAISS 一致性校验**（在 `SpeakerRepository.identify()` 内部实现）：
 ```python
-results = self._vector_index.search(query_emb, topk=TOPK)
-if topk_consistent(results) and results[0].score >= T_HIGH:
-    -> 高置信，返回现有 speaker
-else:
-    -> 低置信 / 未知，由调用方决定新建 Speaker
+# Stage 1：与所有 speaker 的 center 向量比对，快速缩小范围
+candidates = compare_with_centers(query_emb, topn=N_CANDIDATES)
+
+# 若最像的候选 center 分数过低，直接拒识
+if max(candidates, key=lambda c: c.score).score < T_LOW:
+    return IdentificationResult(spk_id=None, score=None, status="UNKNOWN")
+
+# Stage 2：用 FAISS 从全部精选向量中全局检索 Top-K
+topk_results = vector_index.search(query_emb, topk=TOPK)
+
+# 一致性校验：5 个中至少 4 个属于同一 speaker
+if not topk_consistency(topk_results, k=TOPK, min_consistency=TOPK_CONSISTENCY_MIN):
+    return IdentificationResult(spk_id=None, score=None, status="UNKNOWN")
+
+# 取一致性 speaker，计算其精选向量的平均相似度作为最终分数
+best_speaker = most_common_speaker(topk_results)
+final_score = mean_similarity(query_emb, speaker_db.get_entries(best_speaker), k=TOPK)
+
+if final_score >= T_HIGH and best_speaker in candidates:
+    return IdentificationResult(spk_id=best_speaker, score=final_score, status="KNOWN")
+
+return IdentificationResult(spk_id=None, score=None, status="UNKNOWN")
 ```
+
+**设计要点**：
+- 中心向量只负责**快速缩小范围**（粗排），并做第一层快速拒识（低于 `T_LOW` 直接返回 `UNKNOWN`）；
+- **FAISS 全局检索**：Stage 2 不再逐个候选 speaker 分桶计算，而是直接调用 `_vector_index.search()` 在全部精选向量中做全局 Top-K 检索；
+- **一致性校验是核心判决条件**：`topk_consistency()` 确保 Top-K 检索结果中多数（默认 5 选 4）指向**同一个 speaker**，防止因个别离群向量导致误判；
+- 最终分数由一致性 speaker 的精选向量平均分决定，只有 `≥ T_HIGH` 才返回 `KNOWN`；
+- `UNKNOWN` 结果由调用方决定是丢弃、暂存 pending_db，还是立即新建 speaker。
 
 **验证标准**：已知说话人的新音频，识别准确率 > 90%；未知说话人，拒绝识别（不强行归类）。
 
 ---
 
-### Phase 9: 动态更新与主流程封装
+### Phase 9: 动态更新与主流程封装（V2.2 调整）
 
-**目标**：高置信度识别结果，自动更新声纹库。
+**目标**：高置信度识别结果，自动更新声纹库；V2.2 新增输出字段传递。
 
 | 文件 | 核心内容 |
 |------|---------|
-| `src/pipeline.py` | `build_pipeline(embedding_dir, label_strategy) -> SpeakerRepository`：建库主流程；`recognize_pipeline(new_audio, repo, extractor, ...) -> list[SpeakerSegment]`：识别主流程（已过滤 IGNORE 并回填 display_name） |
+| `src/pipeline.py` | `build_pipeline(...)` 和 `recognize_pipeline(...)`；V2.2 调整：识别时把 `IdentificationResult.score` 回填到 `SpeakerSegment.score`；ffmpeg 预处理后的 `sr=16000` 回填到 `SpeakerSegment.sr` |
 
-**`SpeakerRepository.update_speaker()` 逻辑**：
-1. **质量过滤**：`duration < UPDATE_MIN_DURATION` → skip；`cosine_similarity(new_emb, center) > UPDATE_DEDUP_THRESHOLD` → skip
-2. **更新 `speaker_db`**：新 embedding 加入全量原始数据，重新计算加权 center
-3. **更新 `vector_db`**：新 embedding 加入 FAISS 精选向量池（每人最多 `MAX_EMB` 个），超限时删除离 center 最远的 embedding
-4. **重建索引**：调用 `VectorIndex.rebuild()`
+**`recognize_pipeline()` V2.2 变更点**：
+1. **diarization 后**：`replace(seg, segment_id=..., file=..., sr=16000)` 注入 segment_id、file、sr；
+2. **identify 后**：`seg.with_score(result.score)` 把余弦相似度回填；`UNKNOWN` 时 score 为 `null`；
+3. **ASR 对齐后**：`precision` 字段暂留 `null`，待有参考文本时注入（见 Phase 11）。
 
-**验证标准**：多次识别同一人新音频后，该中心向量稳定性提升（同类样本 similarity 升高）。
+**`SpeakerRepository` V2.3 内部变更**：
+1. `_speakers` 存完整 `SpeakerData`（center, embedding_count, **embeddings**, **durations**, profile），精选向量回到 speaker_db；
+2. **移除** `_vector_db` 精选向量存储，`VectorDb` 改为独立的全量原始向量库（中间数据），不由 `SpeakerRepository` 持有；
+3. `build_from_pool()` → 精选向量直接写入 `SpeakerData`，再由 `speaker_db.embeddings` 重建 FAISS；
+4. `save()` / `load()` → 只读写 `speaker_db:main`（JSON），识别库自包含，无需额外 vector_db 文件。
+
+**验证标准**：多次识别同一人新音频后，该中心向量稳定性提升（同类样本 similarity 升高）；输出 JSON 包含全部 V2.2 字段。
 
 ---
 
-### Phase 10: CLI 入口与测试
+### Phase 10: CLI 入口与测试（V2.2 调整）
 
-**目标**：能用命令行跑通整个流程。
+**目标**：能用命令行跑通整个流程，输出包含全部 V2.2 字段。
 
 | 文件 | 核心内容 |
 |------|---------|
-| `main.py` | `argparse` 支持两个子命令：`build`（建库）、`recognize`（识别） |
+| `main.py` | `argparse` 支持两个子命令：`build`（建库）、`recognize`（识别）；V2.2 `recognize` 输出 JSON 包含 `segment_id`, `file`, `duration`, `sr`, `local_speaker`, `global_speaker`, `display_name`, `score`, `text`, `translation`, `precision`, `embedding` |
 | `tests/` | 每个模块至少一个单元测试；`test_pipeline.py` 端到端测试；`tests/test_core_*.py` 覆盖 core 模块 |
 
 **验证标准**：
-- `python main.py build --input_dir ./audio_samples/` 成功建库
-- `python main.py recognize --input ./new_audio.wav` 输出带说话人标签、缅甸语原文、中文翻译的 JSON
+- `python main.py build --embedding_dir ./embeddings/` 成功建库，且 `data/processed/speaker_db/` 下存在自包含的 `speaker_db/main.json`（含 center + 精选 embeddings），以及可选的全量原始向量 `vector_db/main.npz`（中间数据）
+- `python main.py recognize --input ./new_audio.wav` 输出包含全部 V2.2 字段的 JSON
+
+---
+
+### Phase 11: 文本精度评估（precision 字段，已实现）
+
+**目标**：为 `precision` 字段提供 CER-based 精度计算。
+
+**实现方式**：
+- `precision` 采用 **CER**（Character Error Rate）计算，而非 ASR 内部 confidence。
+- 参考文本来源：自动从 SLR80 数据集的三个 CSV（train/dev/test）中按音频文件名匹配查找。当前仅限 SLR80 数据，未来可扩展 `--reference` 参数支持手动传入参考文本。
+- 无匹配参考文本时，`precision` 留 `null`。
+- 计算逻辑：
+  1. 合并该音频所有 segment 的 `text` 得到完整识别文本；
+  2. 用 Levenshtein 距离（Wagner-Fischer）计算与参考文本的 CER；
+  3. `precision = round(max(0.0, 1.0 - cer), 4)`。
+
+**实现位置**：`main.py` 中 `cmd_recognize()` 的收尾阶段（`_load_ground_truth_text` + `_compute_cer`）。
 
 ---
 
@@ -482,7 +636,7 @@ src/core/
 |------|------|------|
 | Pyannote / SpeechBrain 模型下载慢或需 huggingface token | 中 | 提前配置 token，使用国内镜像或本地缓存 |
 | FAISS 在 Windows 上安装困难 | 中 | 用 `faiss-cpu`，如仍失败换预编译包 |
-| 聚类 threshold 调参困难 | 高 | **已解决**：采用两层聚类策略，第一层保守阈值（0.30）保纯度，第二层 centroid 合并（0.35）减碎片；不追求 100% 纯度以避免过拟合到当前数据集统计特性；SLR80 实测最佳参数 `thr=0.30, cthr=0.35, min=3` |
+| 聚类 threshold 调参困难 | 高 | **已解决**：采用两层聚类策略，第一层保守阈值（0.30）保纯度，第二层 centroid 合并（0.35）减碎片；不设置 `min_cluster_size`，避免新 speaker 因片段不足被丢弃；SLR80 实测最佳参数 `thr=0.30, cthr=0.35` |
 | Whisper 缅甸语 ASR 准确率不足 | 高 | Whisper 对缅甸语支持较弱，可能需要 fine-tune 或使用专用缅甸语 ASR 模型 |
 | 缅甸语 → 中文翻译模型稀缺 | 中 | 优先尝试 `Helsinki-NLP/opus-mt-my-zh` 或 mBART，如效果差再调 API |
 | 长音频（>1小时）内存爆炸 | 中 | 分段处理，流式读取 |
@@ -503,12 +657,13 @@ src/core/
 | `EMBEDDING_DIM` | 192 | 声纹向量维度（ECAPA-TDNN） |
 | `DISTANCE_THRESHOLD` | 0.30 | 第一层聚类距离阈值（cosine distance），保守值，保证纯度优先 |
 | `CENTROID_THRESHOLD` | 0.35 | 第二层 centroid 合并阈值（cosine distance）；同一 speaker 的多个子簇 centroid 距离低于此值时合并 |
-| `MIN_CLUSTER_SIZE` | 3 | 第二层最小类大小，低于此值的类被视为噪声，合并到最近的合法类 |
+| `MIN_CLUSTER_SIZE` | — | **已废弃**。不设置最小聚类大小，第一层严格聚类产生的碎片由第二层 centroid 合并自然消解，避免新 speaker 因片段不足被丢弃 |
 | `DEDUP_THRESHOLD` | 0.95 | 去重相似度阈值 |
 | `MAX_EMB` | 20 | 每个 speaker 最大保留 embedding 数 |
 | `TOPK` | 5 | FAISS 检索 TopK |
 | `TOPK_CONSISTENCY_MIN` | 4 | TopK 一致性最小通过数（5 个中至少 4 个一致） |
-| `T_HIGH` | 0.7 | 高置信度阈值 |
+| `T_LOW` | **0.50** | 第一层 center 粗排拒识阈值；若最像的 center 相似度低于此值，直接判定为 UNKNOWN，不进入 FAISS 精排；经 leave-out 测试，此值可挡掉 69-97% 陌生人查询，同时库内误拒率 < 0.6% |
+| `T_HIGH` | **0.65** | 第二层精排高置信度确认阈值；FAISS Top-K 平均相似度 ≥ 此值且 consistency 通过才返回 KNOWN；原值 0.70 经测试会误拒 7-15% 已知人，0.65 误拒率降至 3-6%，同时陌生人误识率接近 0% |
 | `TARGET_RMS` | 0.1 | RMS 归一化目标值 |
 | `MIN_WHISPER_SEGMENT` | 0.5 | Whisper 片段 <0.5s 标记为 IGNORE |
 | `UPDATE_MIN_DURATION` | 2.0 | 动态更新时，<2s 的片段不用于更新声纹库 |
@@ -637,6 +792,6 @@ voice-detection/
 
 ---
 
-*计划版本：V2.1*
-*重构日期：2026-05-16*
-*变更：所有裸 dict 数据结构封装为不可变 dataclass；新增 src/core/ 统一 seams；全局聚类升级为两层策略（保守阈值 + centroid 合并）。*
+*计划版本：V2.3*
+*重构日期：2026-05-18*
+*变更：所有裸 dict 数据结构封装为不可变 dataclass；新增 src/core/ 统一 seams；全局聚类升级为两层策略（保守阈值 + centroid 合并，取消 min_cluster_size）；识别流程升级为两层比对 + FAISS 全局一致性校验（center 粗排 → FAISS Top-K 检索 → `topk_consistency` 5 选 4）；新增 `T_LOW` 第一层拒识阈值；speaker_db / vector_db 持久化拆分。*
