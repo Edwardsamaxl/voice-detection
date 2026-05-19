@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from config import MIN_WHISPER_SEGMENT
+from config import MIN_ASR_SEGMENT
 from src.core.types import SpeakerSegment
 
 
@@ -20,7 +20,7 @@ def align_segments(
     aligned: list[SpeakerSegment] = []
     for seg in whisper_segments:
         start, end = seg.start, seg.end
-        if end - start < MIN_WHISPER_SEGMENT:
+        if end - start < MIN_ASR_SEGMENT:
             speaker = "IGNORE"
         else:
             cropped = diarization_annotation.crop(Segment(start, end))

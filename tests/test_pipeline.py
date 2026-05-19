@@ -235,7 +235,7 @@ class TestRecognizePipelineNewSpeaker:
             def update_speaker(self, _spk_id, _new_emb, _duration):
                 return True
 
-            def add_speaker(self, _spk_id, _embeddings, _durations):
+            def add_speaker(self, spk_id, embeddings, durations, profile=None):
                 pass
 
         monkeypatch.setattr("src.diarization.segment.run_diarization", lambda *_args, **_kw: "annotation")
@@ -255,7 +255,7 @@ class TestRecognizePipelineNewSpeaker:
             wav_path="sample.wav", repo=repo, extractor=FakeExtractor(), translator=None,
             asr_backend="whisper",
         )
-        assert result[0].global_speaker == "UNKNOWN"
+        assert result[0].global_speaker == "SPK_0"
 
     def test_skips_ignore_segments(self, monkeypatch):
         emb = np.zeros(192, dtype=np.float32)

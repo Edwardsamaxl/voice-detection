@@ -6,6 +6,7 @@ Subcommands:
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -13,6 +14,55 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import PROCESSED_DIR
+
+_GROUND_TRUTH_CSVS = [
+    os.path.join("data", "raw", "burmese_asr", "speech_asr_slr80_my_trainsets.csv"),
+    os.path.join("data", "raw", "burmese_asr", "speech_asr_slr80_my_devsets.csv"),
+    os.path.join("data", "raw", "burmese_asr", "speech_asr_slr80_my_testsets.csv"),
+]
+
+
+def _load_ground_truth_text(audio_path: str) -> str | None:
+    """Look up reference text from SLR80 CSV files by basename."""
+    basename = os.path.basename(audio_path)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for csv_name in _GROUND_TRUTH_CSVS:
+        csv_path = os.path.join(base_dir, csv_name)
+        if not os.path.exists(csv_path):
+            continue
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if os.path.basename(row.get("Audio:FILE", "")) == basename:
+                    return row.get("Text:LABEL")
+    return None
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Wagner-Fischer algorithm for edit distance on Unicode code points."""
+    m, n = len(a), len(b)
+    if m == 0:
+        return n
+    if n == 0:
+        return m
+    prev = list(range(n + 1))
+    curr = [0] * (n + 1)
+    for i in range(1, m + 1):
+        curr[0] = i
+        ai = a[i - 1]
+        for j in range(1, n + 1):
+            cost = 0 if ai == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev, curr = curr, prev
+    return prev[n]
+
+
+def _compute_cer(hypothesis: str | None, reference: str | None) -> float | None:
+    """Compute Character Error Rate. Returns 0.0~1.0+ or None if inputs missing."""
+    if not hypothesis or not reference:
+        return None
+    dist = _levenshtein_distance(hypothesis, reference)
+    return dist / len(reference)
 
 
 def cmd_build(args: argparse.Namespace) -> None:
@@ -64,6 +114,14 @@ def cmd_recognize(args: argparse.Namespace) -> None:
         device=args.device,
         asr_backend=args.asr_backend,
     )
+
+    full_text = " ".join(seg.get("text", "").strip() for seg in result if seg.get("text")).strip()
+    ground_truth = _load_ground_truth_text(args.input)
+    cer = _compute_cer(full_text, ground_truth)
+    if cer is not None:
+        precision = round(max(0.0, 1.0 - cer), 4)
+        for seg in result:
+            seg["precision"] = precision
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:

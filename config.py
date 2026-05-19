@@ -30,12 +30,11 @@ MAX_EMB = 20
 
 # Recognition
 TOPK = 5
-TOPK_CONSISTENCY_MIN = 4
 T_LOW = 0.50
 T_HIGH = 0.65
 
 # ASR / Alignment
-MIN_WHISPER_SEGMENT = 0.5
+MIN_ASR_SEGMENT = 0.5
 
 # Dynamic update
 UPDATE_MIN_DURATION = 2.0

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from unittest import mock
 
-from config import EMBEDDING_DIM, MAX_EMB, TOPK
+from config import EMBEDDING_DIM, MAX_EMB
 from src.core.pool import EmbeddingPool
 from src.core.repository import SpeakerRepository, VectorDb
 from src.core.storage import MemoryStorage
@@ -132,44 +132,20 @@ class TestSpeakerRepositoryBuildFromPool:
 
 class TestSpeakerRepositoryIdentify:
     def _make_repo(self, speakers: dict[str, np.ndarray]) -> SpeakerRepository:
-        index = FaissVectorIndex()
-        vectors = np.stack(list(speakers.values())).astype(np.float32)
-        labels = list(speakers.keys())
-        index.build(vectors, labels)
-        repo = SpeakerRepository(vector_index=index)
-        # Manually inject speakers and vector_db so identify works end-to-end
+        repo = SpeakerRepository(vector_index=FaissVectorIndex())
         for spk_id, vec in speakers.items():
-            repo._speakers[spk_id] = SpeakerData(
-                spk_id=spk_id,
-                center=vec,
-                embedding_count=1,
-            )
-            repo._vector_db.set_entries(
-                spk_id, [VectorEntry(spk_id=spk_id, embedding=vec, duration=1.0)]
-            )
+            repo.add_speaker(spk_id, [vec], [1.0])
         return repo
 
     def test_no_results_returns_unknown(self):
         repo = SpeakerRepository(vector_index=FaissVectorIndex())
-        repo._vector_index.build(np.empty((0, EMBEDDING_DIM), dtype=np.float32), [])
         result = repo.identify(np.ones(EMBEDDING_DIM, dtype=np.float32))
         assert result == IdentificationResult(speaker=None, score=0.0, confidence="unknown")
 
-    def test_high_score_and_consistent_returns_high(self):
+    def test_high_score_returns_high(self):
         vec = np.zeros(EMBEDDING_DIM, dtype=np.float32)
         vec[0] = 1.0
-        # Need enough vectors so topk consistency (4/5) passes
-        index = FaissVectorIndex()
-        vectors = np.stack([vec] * 5).astype(np.float32)
-        index.build(vectors, ["SPK_0"] * 5)
-        repo = SpeakerRepository(vector_index=index)
-        repo._speakers["SPK_0"] = SpeakerData(
-            spk_id="SPK_0", center=vec, embedding_count=5
-        )
-        repo._vector_db.set_entries(
-            "SPK_0",
-            [VectorEntry(spk_id="SPK_0", embedding=vec, duration=1.0) for _ in range(5)],
-        )
+        repo = self._make_repo({"SPK_0": vec})
         result = repo.identify(vec)
         assert result.speaker == "SPK_0"
         assert result.confidence == "high"
@@ -185,22 +161,15 @@ class TestSpeakerRepositoryIdentify:
         assert result.confidence == "low"
         assert result.speaker is None
 
-    def test_high_score_but_inconsistent_returns_low(self):
-        # Build repo with multiple speakers; query closer to SPK_0 but topk spread
+    def test_high_score_with_multiple_speakers(self):
         v0 = np.zeros(EMBEDDING_DIM, dtype=np.float32)
         v0[0] = 1.0
         v1 = np.zeros(EMBEDDING_DIM, dtype=np.float32)
         v1[1] = 1.0
-        v2 = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-        v2[2] = 1.0
-        v3 = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-        v3[3] = 1.0
-        v4 = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-        v4[4] = 1.0
-        repo = self._make_repo({"SPK_0": v0, "SPK_1": v1, "SPK_2": v2, "SPK_3": v3, "SPK_4": v4})
+        repo = self._make_repo({"SPK_0": v0, "SPK_1": v1})
         result = repo.identify(v0)
-        # Even if best score is high, consistency across topk may fail
-        assert result.confidence in ("high", "low")
+        assert result.speaker == "SPK_0"
+        assert result.confidence == "high"
 
 
 class TestSpeakerRepositoryAddSpeaker:
@@ -295,17 +264,20 @@ class TestSpeakerRepositorySaveLoad:
         emb[0] = 1.0
         repo.add_speaker("SPK_0", [emb], [1.0])
         repo.assign_name("SPK_0", "Alice")
-        repo.save("db:v1", "vector_db:v1")
+        repo.save("db:v1")
 
         repo2 = SpeakerRepository(
             vector_index=FaissVectorIndex(), storage=storage, vector_storage=storage
         )
-        repo2.load("db:v1", "vector_db:v1")
+        repo2.load("db:v1")
         spk = repo2.get_speaker("SPK_0")
         assert spk is not None
         assert spk.profile is not None
         assert spk.profile.name == "Alice"
         assert np.allclose(spk.center, emb)
+        assert spk.embeddings is not None
+        assert len(spk.embeddings) == 1
+        assert np.allclose(spk.embeddings[0], emb)
 
     def test_save_without_storage_raises(self):
         repo = SpeakerRepository(vector_index=FaissVectorIndex())

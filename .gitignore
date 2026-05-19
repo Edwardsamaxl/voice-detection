@@ -170,3 +170,12 @@ check.md
 # Local log files
 *.log
 
+# Temp / debug files
+tmp_*
+*_output.txt
+scripts/debug_*.py
+
+# Backup files
+*.bak
+*.orig
+

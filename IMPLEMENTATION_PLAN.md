@@ -95,8 +95,9 @@ EmbeddingPool（全量原始数据，封装后）
         ↓
 SpeakerRepository.build_from_pool()
         ↓
-  ├─→ speaker_db（识别库）   → 每人一条记录：weighted center + 精选 embeddings（≤20 个）
-  ├─→ vector_db（全量库）    → 聚类前/后的全部原始向量（中间数据，供重新聚类或追溯）
+  ├─→ speaker_db（识别元数据） → 轻量：weighted center + embedding_count + profile
+  ├─→ selected_db（识别向量）  → 精选 embeddings（≤20个/人），供 FAISS 建索引做精排
+  │   注：全量原始向量（聚类前所有 segments）由 NpzStorage 单独管理，不参与识别
   ├─→ speaker_profile（人名表）→ 显示层（SPK_ID → 姓名）
   └─→ data_store（结果缓存）  → 业务数据（分段 + speaker + text + translation）
 ```

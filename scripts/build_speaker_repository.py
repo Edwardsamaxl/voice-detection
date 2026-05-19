@@ -11,6 +11,8 @@ import logging
 import os
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from config import CENTROID_THRESHOLD, DISTANCE_THRESHOLD
@@ -20,7 +22,7 @@ from src.clustering.cluster import (
 )
 from src.clustering.pool import build_embedding_pool
 from src.core.repository import SpeakerRepository
-from src.core.storage import JsonStorage, PickleStorage
+from src.core.storage import JsonStorage, NpzStorage, PickleStorage
 from src.speaker_db.vector_index import VectorIndex
 
 logging.basicConfig(
@@ -96,6 +98,23 @@ def main():
 
     logger.info("Persisting to %s...", args.output_dir)
     repo.save("speaker_db:main")
+
+    spk_ids = []
+    embeddings = []
+    durations = []
+    for seg in clustered_pool:
+        spk_ids.append(seg.global_speaker or "UNKNOWN")
+        embeddings.append(seg.embedding)
+        durations.append(seg.duration)
+    npz_storage = NpzStorage(args.output_dir)
+    npz_storage.save(
+        "vector_db:main",
+        {
+            "spk_ids": np.array(spk_ids, dtype=str),
+            "embeddings": np.stack(embeddings).astype(np.float32),
+            "durations": np.array(durations, dtype=np.float32),
+        },
+    )
 
     pickle_storage = PickleStorage(args.output_dir)
     pickle_storage.save(

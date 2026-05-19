@@ -40,6 +40,7 @@ class SampleResult:
     hyp: str
     wer: float
     cer: float
+    precision: float
     ref_words: int
     ref_chars: int
     seconds: float
@@ -204,12 +205,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         total_char_err += char_err
         total_chars += len(ref_c)
 
+        cer = char_err / len(ref_c) if ref_c else (0.0 if not hyp_c else 1.0)
         sample = SampleResult(
             audio=rel_audio,
             ref=ref,
             hyp=hyp,
             wer=word_err / len(ref_w) if ref_w else (0.0 if not hyp_w else 1.0),
-            cer=char_err / len(ref_c) if ref_c else (0.0 if not hyp_c else 1.0),
+            cer=cer,
+            precision=round(1.0 - cer, 4),
             ref_words=len(ref_w),
             ref_chars=len(ref_c),
             seconds=seconds,
@@ -255,6 +258,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "count": len(results),
         "wer": total_word_err / max(total_words, 1),
         "cer": total_char_err / max(total_chars, 1),
+        "precision": round(1.0 - total_char_err / max(total_chars, 1), 4),
         "total_word_err": total_word_err,
         "total_words": total_words,
         "total_char_err": total_char_err,
